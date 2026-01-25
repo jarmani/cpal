@@ -19,6 +19,8 @@ pub(crate) mod audioworklet;
 pub(crate) mod coreaudio;
 #[cfg(target_os = "emscripten")]
 pub(crate) mod emscripten;
+#[cfg(target_os = "openbsd")]
+pub(crate) mod sndio;
 #[cfg(all(
     feature = "jack",
     any(
@@ -44,6 +46,7 @@ pub(crate) mod custom;
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "netbsd",
+    target_os = "openbsd",
     target_os = "macos",
     target_os = "ios",
     target_os = "emscripten",
