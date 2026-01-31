@@ -589,12 +589,12 @@ fn sample_format_to_sndio(sample_format: SampleFormat) -> Option<SampleFormatInf
     match sample_format {
         SampleFormat::I8 => Some(SampleFormatInfo {
             bits: 8,
-            bps: 2,
+            bps: 1,
             sig: 1,
         }),
         SampleFormat::U8 => Some(SampleFormatInfo {
             bits: 8,
-            bps: 2,
+            bps: 1,
             sig: 0,
         }),
         SampleFormat::I16 => Some(SampleFormatInfo {
