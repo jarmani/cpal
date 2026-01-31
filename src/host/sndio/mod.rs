@@ -14,8 +14,10 @@ use crate::{
     DeviceDescriptionBuilder, DeviceId, DeviceIdError, DeviceNameError, DevicesError,
     OutputCallbackInfo, OutputStreamTimestamp, PauseStreamError, PlayStreamError, SampleFormat,
     StreamConfig, StreamError, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
-    SupportedStreamConfigsError,
+    SupportedStreamConfigsError, I24, U24
 };
+
+use dasp_sample::{Sample, FromSample};
 
 pub struct Host;
 
@@ -338,11 +340,23 @@ where
     E: FnMut(StreamError) + Send + 'static,
 {
     match inner.sample_format {
+        SampleFormat::I8 => {
+            output_loop_typed::<i8, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U8 => {
+            output_loop_typed::<u8, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
         SampleFormat::I16 => {
             output_loop_typed::<i16, _, _>(inner, &mut data_callback, &mut error_callback)
         }
         SampleFormat::U16 => {
             output_loop_typed::<u16, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I24 => {
+            output_loop_typed::<I24, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U24 => {
+            output_loop_typed::<U24, _, _>(inner, &mut data_callback, &mut error_callback)
         }
         SampleFormat::I32 => {
             output_loop_typed::<i32, _, _>(inner, &mut data_callback, &mut error_callback)
@@ -350,12 +364,17 @@ where
         SampleFormat::U32 => {
             output_loop_typed::<u32, _, _>(inner, &mut data_callback, &mut error_callback)
         }
-        _ => {
-            let mut state = inner.state.lock().unwrap();
-            state.shutdown = true;
-            state.playing = false;
-            inner.state_ready.notify_all();
-            error_callback(StreamError::StreamInvalidated);
+        SampleFormat::F32 => {
+            output_loop_typed::<f32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I64 => {
+            output_loop_typed::<i64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U64 => {
+            output_loop_typed::<u64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::F64 => {
+            output_loop_typed::<f64, _, _>(inner, &mut data_callback, &mut error_callback)
         }
     }
 }
@@ -365,9 +384,23 @@ where
     T: Copy + Default,
     D: FnMut(&mut Data, &OutputCallbackInfo),
     E: FnMut(StreamError),
+    i32: FromSample<T>,
 {
+    let non_native = vec![
+        SampleFormat::F32,
+        SampleFormat::I64,
+        SampleFormat::U64,
+        SampleFormat::F64];
     let sample_count = inner.buffer_frames * inner.channels as usize;
-    let mut buffer = vec![T::default(); sample_count];
+    let mut callback_buffer = vec![T::default(); sample_count];
+    let mut device_buffer;
+    if non_native.contains(&inner.sample_format) {
+        /* will convert u64 into i32 to keep it simple, shorter */
+        device_buffer = vec![i32::default(); sample_count];
+    } else {
+        /* please cargo, device_buffer is guarded by non_native check */
+        device_buffer = Vec::new();
+    }
 
     loop {
         let start_instant = {
@@ -394,15 +427,24 @@ where
         let info = OutputCallbackInfo::new(timestamp);
 
         let mut data = unsafe {
-            Data::from_parts(buffer.as_mut_ptr() as *mut (), buffer.len(), inner.sample_format)
+            Data::from_parts(callback_buffer.as_mut_ptr() as *mut (),
+            callback_buffer.len(), inner.sample_format)
         };
         data_callback(&mut data, &info);
 
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                buffer.as_ptr() as *const u8,
-                buffer.len() * std::mem::size_of::<T>(),
-            )
+        /* make sure to match all non_native SampleFormat */
+        let bytes = if non_native.contains(&inner.sample_format) {
+            for (dst, src) in device_buffer.iter_mut().zip(callback_buffer.iter()) {
+                *dst = i32::from_sample(*src);
+            }
+            unsafe {
+                    std::slice::from_raw_parts(
+                        device_buffer.as_ptr() as *const u8,
+                        device_buffer.len() * std::mem::size_of::<i32>(),
+                    )
+            }
+        } else {
+            data.bytes()
         };
         if !write_all(inner.hdl.0, bytes) {
             let mut state = inner.state.lock().unwrap();
@@ -545,6 +587,16 @@ struct SampleFormatInfo {
 
 fn sample_format_to_sndio(sample_format: SampleFormat) -> Option<SampleFormatInfo> {
     match sample_format {
+        SampleFormat::I8 => Some(SampleFormatInfo {
+            bits: 8,
+            bps: 2,
+            sig: 1,
+        }),
+        SampleFormat::U8 => Some(SampleFormatInfo {
+            bits: 8,
+            bps: 2,
+            sig: 0,
+        }),
         SampleFormat::I16 => Some(SampleFormatInfo {
             bits: 16,
             bps: 2,
@@ -553,6 +605,16 @@ fn sample_format_to_sndio(sample_format: SampleFormat) -> Option<SampleFormatInf
         SampleFormat::U16 => Some(SampleFormatInfo {
             bits: 16,
             bps: 2,
+            sig: 0,
+        }),
+        SampleFormat::I24 => Some(SampleFormatInfo {
+            bits: 24,
+            bps: 4,
+            sig: 1,
+        }),
+        SampleFormat::U24 => Some(SampleFormatInfo {
+            bits: 24,
+            bps: 4,
             sig: 0,
         }),
         SampleFormat::I32 => Some(SampleFormatInfo {
@@ -565,14 +627,44 @@ fn sample_format_to_sndio(sample_format: SampleFormat) -> Option<SampleFormatInf
             bps: 4,
             sig: 0,
         }),
-        _ => None,
+        /* non native: encode into i32, must match with output_loop_typed() */
+        SampleFormat::F32 => Some(SampleFormatInfo {
+            bits: 32,
+            bps: 4,
+            sig: 1,
+        }),
+        SampleFormat::I64 => Some(SampleFormatInfo {
+            bits: 32,
+            bps: 4,
+            sig: 1,
+        }),
+        SampleFormat::U64 => Some(SampleFormatInfo {
+            bits: 32,
+            bps: 4,
+            sig: 1,
+        }),
+        SampleFormat::F64 => Some(SampleFormatInfo {
+            bits: 32,
+            bps: 4,
+            sig: 1,
+        }),
     }
 }
 
+/* 
+ * There isn't *64 nor F32 because sndio par doesn't support such format.
+ * While the backend can support those formats by re-encoding samples,
+ * we deliberately do not advertise theim. Thus, consumers checking
+ * supported_output_configs() will use the most efficient SampleFormat.
+ */
 fn sample_format_from_par(par: &sndio::sio_par) -> Option<SampleFormat> {
     match (par.bits, par.sig) {
+        (8, 1) => Some(SampleFormat::I8),
+        (8, 0) => Some(SampleFormat::U8),
         (16, 1) => Some(SampleFormat::I16),
         (16, 0) => Some(SampleFormat::U16),
+        (24, 1) => Some(SampleFormat::I24),
+        (24, 0) => Some(SampleFormat::U24),
         (32, 1) => Some(SampleFormat::I32),
         (32, 0) => Some(SampleFormat::U32),
         _ => None,
