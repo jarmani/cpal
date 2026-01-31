@@ -393,14 +393,12 @@ where
         SampleFormat::F64];
     let sample_count = inner.buffer_frames * inner.channels as usize;
     let mut callback_buffer = vec![T::default(); sample_count];
-    let mut device_buffer;
-    if non_native.contains(&inner.sample_format) {
+    let mut device_buffer = if non_native.contains(&inner.sample_format) {
         /* will convert u64 into i32 to keep it simple, shorter */
-        device_buffer = vec![i32::default(); sample_count];
+        Some(vec![i32::default(); sample_count])
     } else {
-        /* please cargo, device_buffer is guarded by non_native check */
-        device_buffer = Vec::new();
-    }
+        None
+    };
 
     loop {
         let start_instant = {
@@ -432,16 +430,15 @@ where
         };
         data_callback(&mut data, &info);
 
-        /* make sure to match all non_native SampleFormat */
-        let bytes = if non_native.contains(&inner.sample_format) {
-            for (dst, src) in device_buffer.iter_mut().zip(callback_buffer.iter()) {
+        let bytes = if let Some(ref mut dev_buf) = device_buffer {
+            for (dst, src) in dev_buf.iter_mut().zip(callback_buffer.iter()) {
                 *dst = i32::from_sample(*src);
             }
             unsafe {
-                    std::slice::from_raw_parts(
-                        device_buffer.as_ptr() as *const u8,
-                        device_buffer.len() * std::mem::size_of::<i32>(),
-                    )
+                std::slice::from_raw_parts(
+                    dev_buf.as_ptr() as *const u8,
+                    dev_buf.len() * std::mem::size_of::<i32>(),
+                )
             }
         } else {
             data.bytes()
