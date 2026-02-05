@@ -10,9 +10,10 @@ use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BufferSize, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
     DeviceDescriptionBuilder, DeviceId, DeviceIdError, DeviceNameError, DevicesError,
-    OutputCallbackInfo, OutputStreamTimestamp, PauseStreamError, PlayStreamError, SampleFormat,
-    StreamConfig, StreamError, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
-    SupportedStreamConfigsError, I24, U24
+    InputCallbackInfo, InputStreamTimestamp, OutputCallbackInfo, OutputStreamTimestamp,
+    PauseStreamError, PlayStreamError, SampleFormat, StreamConfig, StreamError,
+    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    SupportedStreamConfigsError, I24, U24,
 };
 
 use dasp_sample::{Sample, FromSample};
@@ -73,7 +74,7 @@ impl Device {
     fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
         Ok(DeviceDescriptionBuilder::new("Default Device".to_string())
             .driver("sndio".to_string())
-            .direction(crate::DeviceDirection::Output)
+            .direction(crate::DeviceDirection::Duplex)
             .build())
     }
 
@@ -87,7 +88,23 @@ impl Device {
     fn supported_input_configs(
         &self,
     ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
-        Ok(Vec::new().into_iter())
+        let config = match default_input_par() {
+            Ok(par) => {
+                let channels = if par.rchan == 0 { 1 } else { par.rchan as u16 };
+                let rate = if par.rate == 0 { 44_100 } else { par.rate };
+                let sample_format = sample_format_from_par(&par)
+                    .ok_or(SupportedStreamConfigsError::InvalidArgument)?;
+                SupportedStreamConfigRange::new(
+                    channels,
+                    rate,
+                    rate,
+                    SupportedBufferSize::Unknown,
+                    sample_format,
+                )
+            }
+            Err(_) => fallback_input_config_range(),
+        };
+        Ok(vec![config].into_iter())
     }
 
     fn supported_output_configs(
@@ -113,7 +130,15 @@ impl Device {
     }
 
     fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        Err(DefaultStreamConfigError::StreamTypeNotSupported)
+        const EXPECT: &str = "expected at least one valid sndio stream config";
+        let range = self
+            .supported_input_configs()
+            .map_err(|_| DefaultStreamConfigError::DeviceNotAvailable)?
+            .max_by(|a, b| a.cmp_default_heuristics(b))
+            .expect(EXPECT);
+        let config = range.with_sample_rate(range.max_sample_rate());
+
+        Ok(config)
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
@@ -142,7 +167,7 @@ impl HostTrait for Host {
     }
 
     fn default_input_device(&self) -> Option<Self::Device> {
-        None
+        Some(Device)
     }
 
     fn default_output_device(&self) -> Option<Self::Device> {
@@ -185,17 +210,46 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _config: &StreamConfig,
-        _sample_format: SampleFormat,
-        _data_callback: D,
-        _error_callback: E,
+        config: &StreamConfig,
+        sample_format: SampleFormat,
+        data_callback: D,
+        error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&Data, &crate::InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        Err(BuildStreamError::StreamConfigNotSupported)
+        let sample_info = sample_format_to_sndio(sample_format)
+            .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+
+        let mut hdl = open_capture_handle()?;
+        let (par, buffer_frames) = configure_handle(&mut hdl, config, sample_info, true)?;
+
+        let inner = Arc::new(StreamInner {
+            hdl: Mutex::new(hdl),
+            sample_format,
+            channels: par.rchan as u16,
+            sample_rate: par.rate,
+            buffer_frames,
+            state: Mutex::new(StreamState {
+                started: false,
+                playing: false,
+                shutdown: false,
+                start_instant: None,
+            }),
+            state_ready: Condvar::new(),
+            thread: Mutex::new(None),
+        });
+
+        let thread_inner = Arc::clone(&inner);
+        let join_handle = thread::Builder::new()
+            .name("cpal-sndio-input".to_string())
+            .spawn(move || input_loop(thread_inner, data_callback, error_callback))
+            .map_err(|_| BuildStreamError::DeviceNotAvailable)?;
+        *inner.thread.lock().unwrap() = Some(join_handle);
+
+        Ok(Stream { inner })
     }
 
     fn build_output_stream_raw<D, E>(
@@ -214,7 +268,7 @@ impl DeviceTrait for Device {
             .ok_or(BuildStreamError::StreamConfigNotSupported)?;
 
         let mut hdl = open_playback_handle()?;
-        let (par, buffer_frames) = configure_handle(&mut hdl, config, sample_info)?;
+        let (par, buffer_frames) = configure_handle(&mut hdl, config, sample_info, false)?;
 
         let inner = Arc::new(StreamInner {
             hdl: Mutex::new(hdl),
@@ -364,6 +418,144 @@ where
     }
 }
 
+fn input_loop<D, E>(inner: Arc<StreamInner>, mut data_callback: D, mut error_callback: E)
+where
+    D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
+    E: FnMut(StreamError) + Send + 'static,
+{
+    match inner.sample_format {
+        SampleFormat::I8 => {
+            input_loop_typed::<i8, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U8 => {
+            input_loop_typed::<u8, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I16 => {
+            input_loop_typed::<i16, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U16 => {
+            input_loop_typed::<u16, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I24 => {
+            input_loop_typed::<I24, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U24 => {
+            input_loop_typed::<U24, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I32 => {
+            input_loop_typed::<i32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U32 => {
+            input_loop_typed::<u32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::F32 => {
+            input_loop_typed::<f32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I64 => {
+            input_loop_typed::<i64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U64 => {
+            input_loop_typed::<u64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::F64 => {
+            input_loop_typed::<f64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        _ => {
+            error_callback(StreamError::StreamInvalidated);
+        }
+    }
+}
+
+fn input_loop_typed<T, D, E>(inner: Arc<StreamInner>, data_callback: &mut D, error_callback: &mut E)
+where
+    T: Copy + Default + Sample + FromSample<i32>,
+    D: FnMut(&Data, &InputCallbackInfo),
+    E: FnMut(StreamError),
+{
+    let non_native = vec![
+        SampleFormat::F32,
+        SampleFormat::I64,
+        SampleFormat::U64,
+        SampleFormat::F64,
+    ];
+    let sample_count = inner.buffer_frames * inner.channels as usize;
+    let mut callback_buffer = vec![T::default(); sample_count];
+    let mut device_buffer = if non_native.contains(&inner.sample_format) {
+        Some(vec![i32::default(); sample_count])
+    } else {
+        None
+    };
+
+    loop {
+        let start_instant = {
+            let mut state = inner.state.lock().unwrap();
+            while !state.playing && !state.shutdown {
+                state = inner.state_ready.wait(state).unwrap();
+            }
+            if state.shutdown {
+                break;
+            }
+            state.start_instant.get_or_insert_with(Instant::now);
+            *state.start_instant.as_ref().unwrap()
+        };
+
+        let elapsed = start_instant.elapsed();
+        let callback = crate::StreamInstant::new(
+            elapsed.as_secs() as i64,
+            elapsed.subsec_nanos(),
+        );
+        let buffer_duration =
+            Duration::from_secs_f64(inner.buffer_frames as f64 / inner.sample_rate as f64);
+        let capture = callback.sub(buffer_duration).unwrap_or(callback);
+        let timestamp = InputStreamTimestamp { callback, capture };
+        let info = InputCallbackInfo::new(timestamp);
+
+        if let Some(ref mut dev_buf) = device_buffer {
+            let dev_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    dev_buf.as_mut_ptr() as *mut u8,
+                    dev_buf.len() * std::mem::size_of::<i32>(),
+                )
+            };
+            if !read_all(&inner.hdl, dev_bytes) {
+                let mut state = inner.state.lock().unwrap();
+                state.shutdown = true;
+                state.playing = false;
+                inner.state_ready.notify_all();
+                error_callback(StreamError::DeviceNotAvailable);
+                break;
+            }
+            for (dst, src) in callback_buffer.iter_mut().zip(dev_buf.iter()) {
+                *dst = T::from_sample(*src);
+            }
+        } else {
+            let cb_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    callback_buffer.as_mut_ptr() as *mut u8,
+                    callback_buffer.len() * std::mem::size_of::<T>(),
+                )
+            };
+            if !read_all(&inner.hdl, cb_bytes) {
+                let mut state = inner.state.lock().unwrap();
+                state.shutdown = true;
+                state.playing = false;
+                inner.state_ready.notify_all();
+                error_callback(StreamError::DeviceNotAvailable);
+                break;
+            }
+        }
+
+        let data = unsafe {
+            Data::from_parts(
+                callback_buffer.as_mut_ptr() as *mut (),
+                callback_buffer.len(),
+                inner.sample_format,
+            )
+        };
+        data_callback(&data, &info);
+    }
+}
+
 fn output_loop_typed<T, D, E>(inner: Arc<StreamInner>, data_callback: &mut D, error_callback: &mut E)
 where
     T: Copy + Default,
@@ -451,8 +643,26 @@ fn write_all(hdl: &Mutex<sndio::Sndio>, mut data: &[u8]) -> bool {
     true
 }
 
+fn read_all(hdl: &Mutex<sndio::Sndio>, data: &mut [u8]) -> bool {
+    let mut hdl = hdl.lock().unwrap();
+    let mut offset = 0;
+    while offset < data.len() {
+        let read = hdl.read(&mut data[offset..]);
+        if read == 0 {
+            return false;
+        }
+        offset += read as usize;
+    }
+    true
+}
+
 fn open_playback_handle() -> Result<sndio::Sndio, BuildStreamError> {
     sndio::Sndio::open(None, sndio::Mode::PLAY, false)
+        .ok_or(BuildStreamError::DeviceNotAvailable)
+}
+
+fn open_capture_handle() -> Result<sndio::Sndio, BuildStreamError> {
+    sndio::Sndio::open(None, sndio::Mode::REC, false)
         .ok_or(BuildStreamError::DeviceNotAvailable)
 }
 
@@ -460,11 +670,12 @@ fn configure_handle(
     hdl: &mut sndio::Sndio,
     config: &StreamConfig,
     sample_info: SampleFormatInfo,
+    is_input: bool,
 ) -> Result<(sndio::Par, usize), BuildStreamError> {
     let mut par = sndio::Sndio::init_par();
     par.rate = config.sample_rate;
-    par.pchan = config.channels as u32;
-    par.rchan = 0;
+    par.pchan = if is_input { 0 } else { config.channels as u32 };
+    par.rchan = if is_input { config.channels as u32 } else { 0 };
     par.bits = sample_info.bits;
     par.bps = sample_info.bps;
     par.sig = sample_info.sig;
@@ -483,7 +694,10 @@ fn configure_handle(
         return Err(BuildStreamError::DeviceNotAvailable);
     }
 
-    if par.pchan != config.channels as u32 || par.rate != config.sample_rate {
+    if (is_input && par.rchan != config.channels as u32)
+        || (!is_input && par.pchan != config.channels as u32)
+        || par.rate != config.sample_rate
+    {
         return Err(BuildStreamError::StreamConfigNotSupported);
     }
     if par.bits != sample_info.bits || par.sig != sample_info.sig {
@@ -522,6 +736,29 @@ fn default_device_par() -> Result<sndio::Par, BuildStreamError> {
     par.sig = 1;
     par.le = sndio::SIO_LE_NATIVE as u32;
     par.msb = 1;
+    let ok = hdl.set_par(&mut par);
+    if !ok {
+        return Err(BuildStreamError::StreamConfigNotSupported);
+    }
+    let ok = hdl.get_par(&mut par);
+    if !ok {
+        Err(BuildStreamError::DeviceNotAvailable)
+    } else {
+        Ok(par)
+    }
+}
+
+fn default_input_par() -> Result<sndio::Par, BuildStreamError> {
+    let mut hdl = open_capture_handle()?;
+    let mut par = sndio::Sndio::init_par();
+    par.rate = 44_100;
+    par.pchan = 0;
+    par.rchan = 2;
+    par.bits = 16;
+    par.bps = 2;
+    par.sig = 1;
+    par.le = sndio::SIO_LE_NATIVE as u32;
+    par.msb = 0;
     let ok = hdl.set_par(&mut par);
     if !ok {
         return Err(BuildStreamError::StreamConfigNotSupported);
@@ -628,6 +865,16 @@ fn sample_format_from_par(par: &sndio::Par) -> Option<SampleFormat> {
 }
 
 fn fallback_output_config_range() -> SupportedStreamConfigRange {
+    SupportedStreamConfigRange::new(
+        2,
+        44_100,
+        44_100,
+        SupportedBufferSize::Unknown,
+        SampleFormat::I16,
+    )
+}
+
+fn fallback_input_config_range() -> SupportedStreamConfigRange {
     SupportedStreamConfigRange::new(
         2,
         44_100,
