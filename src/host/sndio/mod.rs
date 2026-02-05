@@ -6,8 +6,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use sndio_sys as sndio;
-
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BufferSize, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
@@ -32,7 +30,7 @@ pub struct Stream {
 }
 
 struct StreamInner {
-    hdl: SndioHandle,
+    hdl: Mutex<sndio::Sndio>,
     sample_format: SampleFormat,
     channels: u16,
     sample_rate: u32,
@@ -48,13 +46,6 @@ struct StreamState {
     shutdown: bool,
     start_instant: Option<Instant>,
 }
-
-#[derive(Copy, Clone)]
-struct SndioHandle(*mut sndio::sio_hdl);
-
-// sndio handles are opaque pointers managed by the library.
-unsafe impl Send for SndioHandle {}
-unsafe impl Sync for SndioHandle {}
 
 // Sndio streams are safe to send and share between threads.
 unsafe impl Send for Stream {}
@@ -222,15 +213,11 @@ impl DeviceTrait for Device {
         let sample_info = sample_format_to_sndio(sample_format)
             .ok_or(BuildStreamError::StreamConfigNotSupported)?;
 
-        let hdl = open_playback_handle()?;
-        let (par, buffer_frames) =
-            configure_handle(hdl, config, sample_info).map_err(|err| {
-                unsafe { sndio::sio_close(hdl.0) };
-                err
-            })?;
+        let mut hdl = open_playback_handle()?;
+        let (par, buffer_frames) = configure_handle(&mut hdl, config, sample_info)?;
 
         let inner = Arc::new(StreamInner {
-            hdl,
+            hdl: Mutex::new(hdl),
             sample_format,
             channels: par.pchan as u16,
             sample_rate: par.rate,
@@ -277,9 +264,6 @@ impl Drop for Stream {
         if let Some(handle) = self.inner.thread.lock().unwrap().take() {
             let _ = handle.join();
         }
-        unsafe {
-            sndio::sio_close(self.inner.hdl.0);
-        }
     }
 }
 
@@ -290,8 +274,8 @@ impl StreamInner {
             return Err(PlayStreamError::DeviceNotAvailable);
         }
         if !state.started {
-            let ok = unsafe { sndio::sio_start(self.hdl.0) };
-            if ok == 0 {
+            let ok = self.hdl.lock().unwrap().start();
+            if !ok {
                 return Err(PlayStreamError::DeviceNotAvailable);
             }
             state.started = true;
@@ -311,9 +295,7 @@ impl StreamInner {
             state.playing = false;
             self.state_ready.notify_all();
             if state.started {
-                unsafe {
-                    sndio::sio_stop(self.hdl.0);
-                }
+                let _ = self.hdl.lock().unwrap().stop();
                 state.started = false;
             }
         }
@@ -443,7 +425,7 @@ where
         } else {
             data.bytes()
         };
-        if !write_all(inner.hdl.0, bytes) {
+        if !write_all(&inner.hdl, bytes) {
             let mut state = inner.state.lock().unwrap();
             state.shutdown = true;
             state.playing = false;
@@ -454,13 +436,10 @@ where
     }
 }
 
-fn write_all(hdl: *mut sndio::sio_hdl, mut data: &[u8]) -> bool {
+fn write_all(hdl: &Mutex<sndio::Sndio>, mut data: &[u8]) -> bool {
+    let mut hdl = hdl.lock().unwrap();
     while !data.is_empty() {
-        let len: u64 = match data.len().try_into() {
-            Ok(value) => value,
-            Err(_) => return false,
-        };
-        let written = unsafe { sndio::sio_write(hdl, data.as_ptr() as *const _, len) };
+        let written = hdl.write(data);
         if written == 0 {
             return false;
         }
@@ -469,32 +448,17 @@ fn write_all(hdl: *mut sndio::sio_hdl, mut data: &[u8]) -> bool {
     true
 }
 
-fn open_playback_handle() -> Result<SndioHandle, BuildStreamError> {
-    let mut hdl = unsafe {
-        sndio::sio_open(
-            sndio::SIO_DEVANY.as_ptr() as *const _,
-            sndio::SIO_PLAY as u32,
-            0,
-        )
-    };
-    if hdl.is_null() {
-        hdl = unsafe { sndio::sio_open(std::ptr::null(), sndio::SIO_PLAY as u32, 0) };
-    }
-    if hdl.is_null() {
-        return Err(BuildStreamError::DeviceNotAvailable);
-    }
-    Ok(SndioHandle(hdl))
+fn open_playback_handle() -> Result<sndio::Sndio, BuildStreamError> {
+    sndio::Sndio::open(None, sndio::Mode::PLAY, false)
+        .ok_or(BuildStreamError::DeviceNotAvailable)
 }
 
 fn configure_handle(
-    hdl: SndioHandle,
+    hdl: &mut sndio::Sndio,
     config: &StreamConfig,
     sample_info: SampleFormatInfo,
-) -> Result<(sndio::sio_par, usize), BuildStreamError> {
-    let mut par: sndio::sio_par = unsafe { std::mem::zeroed() };
-    unsafe {
-        sndio::sio_initpar(&mut par);
-    }
+) -> Result<(sndio::Par, usize), BuildStreamError> {
+    let mut par = sndio::Sndio::init_par();
     par.rate = config.sample_rate;
     par.pchan = config.channels as u32;
     par.rchan = 0;
@@ -507,12 +471,12 @@ fn configure_handle(
         par.appbufsz = frames;
     }
 
-    let ok = unsafe { sndio::sio_setpar(hdl.0, &mut par) };
-    if ok == 0 {
+    let ok = hdl.set_par(&mut par);
+    if !ok {
         return Err(BuildStreamError::StreamConfigNotSupported);
     }
-    let ok = unsafe { sndio::sio_getpar(hdl.0, &mut par) };
-    if ok == 0 {
+    let ok = hdl.get_par(&mut par);
+    if !ok {
         return Err(BuildStreamError::DeviceNotAvailable);
     }
 
@@ -544,12 +508,9 @@ fn configure_handle(
     Ok((par, buffer_frames))
 }
 
-fn default_device_par() -> Result<sndio::sio_par, BuildStreamError> {
-    let hdl = open_playback_handle()?;
-    let mut par: sndio::sio_par = unsafe { std::mem::zeroed() };
-    unsafe {
-        sndio::sio_initpar(&mut par);
-    }
+fn default_device_par() -> Result<sndio::Par, BuildStreamError> {
+    let mut hdl = open_playback_handle()?;
+    let mut par = sndio::Sndio::init_par();
     par.rate = 44_100;
     par.pchan = 2;
     par.rchan = 0;
@@ -558,18 +519,12 @@ fn default_device_par() -> Result<sndio::sio_par, BuildStreamError> {
     par.sig = 1;
     par.le = sndio::SIO_LE_NATIVE as u32;
     par.msb = 1;
-    let ok = unsafe { sndio::sio_setpar(hdl.0, &mut par) };
-    if ok == 0 {
-        unsafe {
-            sndio::sio_close(hdl.0);
-        }
+    let ok = hdl.set_par(&mut par);
+    if !ok {
         return Err(BuildStreamError::StreamConfigNotSupported);
     }
-    let ok = unsafe { sndio::sio_getpar(hdl.0, &mut par) };
-    unsafe {
-        sndio::sio_close(hdl.0);
-    }
-    if ok == 0 {
+    let ok = hdl.get_par(&mut par);
+    if !ok {
         Err(BuildStreamError::DeviceNotAvailable)
     } else {
         Ok(par)
@@ -654,7 +609,7 @@ fn sample_format_to_sndio(sample_format: SampleFormat) -> Option<SampleFormatInf
  * we deliberately do not advertise theim. Thus, consumers checking
  * supported_output_configs() will use the most efficient SampleFormat.
  */
-fn sample_format_from_par(par: &sndio::sio_par) -> Option<SampleFormat> {
+fn sample_format_from_par(par: &sndio::Par) -> Option<SampleFormat> {
     match (par.bits, par.sig) {
         (8, 1) => Some(SampleFormat::I8),
         (8, 0) => Some(SampleFormat::U8),
