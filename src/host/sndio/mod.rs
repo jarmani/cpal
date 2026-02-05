@@ -469,7 +469,7 @@ fn configure_handle(
     par.bps = sample_info.bps;
     par.sig = sample_info.sig;
     par.le = sndio::SIO_LE_NATIVE as u32;
-    par.msb = 1;
+    par.msb = 0;
     if let BufferSize::Fixed(frames) = config.buffer_size {
         par.appbufsz = frames;
     }
