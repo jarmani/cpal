@@ -358,6 +358,9 @@ where
         SampleFormat::F64 => {
             output_loop_typed::<f64, _, _>(inner, &mut data_callback, &mut error_callback)
         }
+        _ => {
+            error_callback(StreamError::StreamInvalidated);
+        }
     }
 }
 
@@ -600,6 +603,7 @@ fn sample_format_to_sndio(sample_format: SampleFormat) -> Option<SampleFormatInf
             bps: 4,
             sig: 1,
         }),
+        _ => None,
     }
 }
 
