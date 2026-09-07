@@ -2,30 +2,31 @@
 //!
 //! Fallback no-op backend for unsupported platforms.
 
+use std::fmt;
 use std::time::Duration;
 
-use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
-    BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription, DeviceDescriptionBuilder,
-    DeviceId, DeviceIdError, DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo,
-    PauseStreamError, PlayStreamError, SampleFormat, StreamConfig, StreamError,
-    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
+    CallbackInfo, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error, FrameCount,
+    SampleFormat, StreamConfig, StreamInstant, SupportedStreamConfig, SupportedStreamConfigRange,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-#[derive(Default)]
 pub struct Devices;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Device;
 
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let desc = self.description().map_err(|_| fmt::Error)?;
+        f.write_str(desc.name())
+    }
+}
+
 pub struct Host;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Stream;
-
-// Compile-time assertion that Stream is Send and Sync
-crate::assert_stream_send!(Stream);
-crate::assert_stream_sync!(Stream);
 
 #[derive(Clone)]
 pub struct SupportedInputConfigs;
@@ -34,14 +35,8 @@ pub struct SupportedOutputConfigs;
 
 impl Host {
     #[allow(dead_code)]
-    pub fn new() -> Result<Self, crate::HostUnavailable> {
-        Ok(Host)
-    }
-}
-
-impl Devices {
-    pub fn new() -> Result<Self, DevicesError> {
-        Ok(Devices)
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self)
     }
 }
 
@@ -50,49 +45,41 @@ impl DeviceTrait for Device {
     type SupportedOutputConfigs = SupportedOutputConfigs;
     type Stream = Stream;
 
-    fn name(&self) -> Result<String, DeviceNameError> {
-        Ok("null".to_string())
+    fn description(&self) -> Result<DeviceDescription, Error> {
+        Ok(DeviceDescriptionBuilder::new("Null Device").build())
     }
 
-    fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
-        Ok(DeviceDescriptionBuilder::new("Null Device".to_string()).build())
+    fn id(&self) -> Result<DeviceId, Error> {
+        Ok(DeviceId::new(crate::platform::HostId::Null, ""))
     }
 
-    fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId(crate::platform::HostId::Null, String::new()))
-    }
-
-    fn supported_input_configs(
-        &self,
-    ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
+    fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
         unimplemented!()
     }
 
-    fn supported_output_configs(
-        &self,
-    ) -> Result<SupportedOutputConfigs, SupportedStreamConfigsError> {
+    fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
         unimplemented!()
     }
 
-    fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
         unimplemented!()
     }
 
-    fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
         unimplemented!()
     }
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _config: &StreamConfig,
+        _config: StreamConfig,
         _sample_format: SampleFormat,
         _data_callback: D,
         _error_callback: E,
         _timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
-        D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        D: FnMut(&Data, &CallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         unimplemented!()
     }
@@ -100,15 +87,15 @@ impl DeviceTrait for Device {
     /// Create an output stream.
     fn build_output_stream_raw<D, E>(
         &self,
-        _config: &StreamConfig,
+        _config: StreamConfig,
         _sample_format: SampleFormat,
         _data_callback: D,
         _error_callback: E,
         _timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
-        D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        D: FnMut(&mut Data, &CallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         unimplemented!()
     }
@@ -122,25 +109,37 @@ impl HostTrait for Host {
         false
     }
 
-    fn devices(&self) -> Result<Self::Devices, DevicesError> {
-        Devices::new()
+    fn devices(&self) -> Result<Self::Devices, Error> {
+        Ok(Devices)
     }
 
-    fn default_input_device(&self) -> Option<Device> {
+    fn default_input_device(&self) -> Option<Self::Device> {
         None
     }
 
-    fn default_output_device(&self) -> Option<Device> {
+    fn default_output_device(&self) -> Option<Self::Device> {
         None
     }
 }
 
 impl StreamTrait for Stream {
-    fn play(&self) -> Result<(), PlayStreamError> {
+    fn start(&self) -> Result<(), Error> {
         unimplemented!()
     }
 
-    fn pause(&self) -> Result<(), PauseStreamError> {
+    fn pause(&self) -> Result<(), Error> {
+        unimplemented!()
+    }
+
+    fn stop(&self, _timeout: Option<std::time::Duration>) -> Result<(), Error> {
+        unimplemented!()
+    }
+
+    fn now(&self) -> StreamInstant {
+        unimplemented!()
+    }
+
+    fn buffer_size(&self) -> Result<FrameCount, Error> {
         unimplemented!()
     }
 }
@@ -148,7 +147,7 @@ impl StreamTrait for Stream {
 impl Iterator for Devices {
     type Item = Device;
 
-    fn next(&mut self) -> Option<Device> {
+    fn next(&mut self) -> Option<Self::Item> {
         None
     }
 }
@@ -156,7 +155,7 @@ impl Iterator for Devices {
 impl Iterator for SupportedInputConfigs {
     type Item = SupportedStreamConfigRange;
 
-    fn next(&mut self) -> Option<SupportedStreamConfigRange> {
+    fn next(&mut self) -> Option<Self::Item> {
         None
     }
 }
@@ -164,7 +163,7 @@ impl Iterator for SupportedInputConfigs {
 impl Iterator for SupportedOutputConfigs {
     type Item = SupportedStreamConfigRange;
 
-    fn next(&mut self) -> Option<SupportedStreamConfigRange> {
+    fn next(&mut self) -> Option<Self::Item> {
         None
     }
 }

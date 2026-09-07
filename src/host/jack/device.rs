@@ -1,27 +1,25 @@
-use crate::traits::DeviceTrait;
-use crate::{
-    BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
-    DeviceDescriptionBuilder, DeviceDirection, DeviceId, DeviceIdError, DeviceNameError,
-    InputCallbackInfo, OutputCallbackInfo, SampleFormat, SampleRate, StreamConfig, StreamError,
-    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
-    SupportedStreamConfigsError,
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    time::Duration,
 };
-use std::hash::{Hash, Hasher};
-use std::time::Duration;
 
-use super::stream::Stream;
-use super::JACK_SAMPLE_FORMAT;
-
+use super::{JACK_SAMPLE_FORMAT, stream::Stream};
 pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
+use crate::{
+    BufferSize, CallbackInfo, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder,
+    DeviceDirection, DeviceId, Error, ErrorKind, SampleFormat, SampleRate, StreamConfig,
+    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange, traits::DeviceTrait,
+};
 
-const DEFAULT_NUM_CHANNELS: u16 = 2;
-const DEFAULT_SUPPORTED_CHANNELS: [u16; 10] = [1, 2, 4, 6, 8, 16, 24, 32, 48, 64];
+const DEFAULT_NUM_CHANNELS: ChannelCount = 2;
 
 #[derive(Clone, Debug)]
 pub struct Device {
     name: String,
     sample_rate: SampleRate,
     buffer_size: SupportedBufferSize,
+    max_channels: ChannelCount,
     direction: DeviceDirection,
     start_server_automatically: bool,
     connect_ports_automatically: bool,
@@ -33,39 +31,62 @@ impl Device {
         connect_ports_automatically: bool,
         start_server_automatically: bool,
         direction: DeviceDirection,
-    ) -> Result<Self, String> {
-        // ClientOptions are bit flags that you can set with the constants provided
+    ) -> Result<Self, Error> {
         let client_options = super::get_client_options(start_server_automatically);
 
-        // Create a dummy client to find out the sample rate of the server to be able to provide it as a possible config.
-        // This client will be dropped, and a new one will be created when making the stream.
-        // This is a hack due to the fact that the Client must be moved to create the AsyncClient.
-        match super::get_client(&name, client_options) {
-            Ok(client) => Ok(Device {
-                // The name given to the client by JACK, could potentially be different from the name supplied e.g.if there is a name collision
-                name: client.name().to_string(),
-                sample_rate: client.sample_rate(),
-                buffer_size: SupportedBufferSize::Range {
-                    min: client.buffer_size(),
-                    max: client.buffer_size(),
-                },
-                direction,
-                start_server_automatically,
-                connect_ports_automatically,
-            }),
-            Err(e) => Err(e),
-        }
+        // Create a dummy client to find out the sample rate of the server to be able to provide it
+        // as a possible config. This client will be dropped, and a new one will be created when
+        // making the stream. This is a hack due to the fact that the Client must be moved to
+        // create the AsyncClient.
+        let client = super::get_client(&name, client_options)?;
+        let port_pattern = match direction {
+            DeviceDirection::Input => "system:capture_.*",
+            DeviceDirection::Output => "system:playback_.*",
+            _ => {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedOperation,
+                    format!("JACK does not support {direction:?} direction"),
+                ));
+            }
+        };
+        // Enumeration reflects the routed system ports; build_*_stream_raw allows more
+        // channels than this for patching to an unrouted or downstream JACK client.
+        let max_channels = client
+            .ports(Some(port_pattern), None, jack::PortFlags::empty())
+            .len()
+            .try_into()
+            .unwrap_or(DEFAULT_NUM_CHANNELS)
+            .max(DEFAULT_NUM_CHANNELS);
+        Ok(Self {
+            // The name given to the client by JACK, could potentially be different from the name
+            // supplied e.g. if there is a name collision
+            name: client.name().to_owned(),
+            sample_rate: client.sample_rate(),
+            buffer_size: SupportedBufferSize::Range {
+                min: client.buffer_size(),
+                max: client.buffer_size(),
+            },
+            max_channels,
+            direction,
+            start_server_automatically,
+            connect_ports_automatically,
+        })
     }
 
-    fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId(crate::platform::HostId::Jack, self.name.clone()))
+    fn id(&self) -> Result<DeviceId, Error> {
+        // `self.name` carries the process ID (see `Host::new`) so that concurrent cpal
+        // instances get distinct JACK client names. It must not leak into `DeviceId`,
+        // which callers persist across restarts: a synthetic device's direction is the
+        // only part of its identity that's actually stable.
+        let id = if self.is_input() { "input" } else { "output" };
+        Ok(DeviceId::new(crate::platform::HostId::Jack, id))
     }
 
     pub fn default_output_device(
         name: &str,
         connect_ports_automatically: bool,
         start_server_automatically: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Error> {
         let output_client_name = format!("{}_out", name);
         Device::new_device(
             output_client_name,
@@ -79,7 +100,7 @@ impl Device {
         name: &str,
         connect_ports_automatically: bool,
         start_server_automatically: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Error> {
         let input_client_name = format!("{}_in", name);
         Device::new_device(
             input_client_name,
@@ -89,7 +110,7 @@ impl Device {
         )
     }
 
-    pub fn default_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    pub fn default_config(&self) -> Result<SupportedStreamConfig, Error> {
         let channels = DEFAULT_NUM_CHANNELS;
         let sample_rate = self.sample_rate;
         let buffer_size = self.buffer_size;
@@ -111,18 +132,15 @@ impl Device {
             Ok(f) => f,
         };
 
-        let mut supported_configs = vec![];
-
-        for &channels in DEFAULT_SUPPORTED_CHANNELS.iter() {
-            supported_configs.push(SupportedStreamConfigRange {
+        (1..=self.max_channels)
+            .map(|channels| SupportedStreamConfigRange {
                 channels,
                 min_sample_rate: f.sample_rate,
                 max_sample_rate: f.sample_rate,
                 buffer_size: f.buffer_size,
                 sample_format: f.sample_format,
-            });
-        }
-        supported_configs
+            })
+            .collect()
     }
 
     pub fn is_input(&self) -> bool {
@@ -132,20 +150,6 @@ impl Device {
     pub fn is_output(&self) -> bool {
         matches!(self.direction, DeviceDirection::Output)
     }
-
-    /// Validate buffer size if Fixed is specified. This is necessary because JACK buffer size
-    /// is controlled by the JACK server and cannot be changed by clients. Without validation,
-    /// cpal would silently use the server's buffer size even if a different value was requested.
-    fn validate_buffer_size(&self, conf: &StreamConfig) -> Result<(), BuildStreamError> {
-        if let crate::BufferSize::Fixed(requested_size) = conf.buffer_size {
-            if let SupportedBufferSize::Range { min, max } = self.buffer_size {
-                if !(min..=max).contains(&requested_size) {
-                    return Err(BuildStreamError::StreamConfigNotSupported);
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl DeviceTrait for Device {
@@ -153,122 +157,212 @@ impl DeviceTrait for Device {
     type SupportedOutputConfigs = SupportedOutputConfigs;
     type Stream = Stream;
 
-    fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
-        Ok(DeviceDescriptionBuilder::new(self.name.clone())
+    fn description(&self) -> Result<DeviceDescription, Error> {
+        // Not `self.name`: that's the JACK client name, which carries a process ID
+        // uniquifier (see `Host::new`) and isn't meant as a user-facing device label.
+        let name = if self.is_input() {
+            "JACK Input"
+        } else {
+            "JACK Output"
+        };
+        Ok(DeviceDescriptionBuilder::new(name)
             .direction(self.direction)
             .build())
     }
 
-    fn id(&self) -> Result<DeviceId, DeviceIdError> {
+    fn id(&self) -> Result<DeviceId, Error> {
         Device::id(self)
     }
 
-    fn supported_input_configs(
-        &self,
-    ) -> Result<Self::SupportedInputConfigs, SupportedStreamConfigsError> {
+    fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
         Ok(self.supported_configs().into_iter())
     }
 
-    fn supported_output_configs(
-        &self,
-    ) -> Result<Self::SupportedOutputConfigs, SupportedStreamConfigsError> {
+    fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
         Ok(self.supported_configs().into_iter())
     }
 
     /// Returns the default input config
     /// The sample format for JACK audio ports is always "32-bit float mono audio" unless using a custom type.
     /// The sample rate is set by the JACK server.
-    fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
         self.default_config()
     }
 
     /// Returns the default output config
     /// The sample format for JACK audio ports is always "32-bit float mono audio" unless using a custom type.
     /// The sample rate is set by the JACK server.
-    fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
         self.default_config()
     }
 
     fn build_input_stream_raw<D, E>(
         &self,
-        conf: &StreamConfig,
+        conf: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+        timeout: Option<Duration>,
+    ) -> Result<Self::Stream, Error>
     where
-        D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        D: FnMut(&Data, &CallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         if self.is_output() {
-            // Trying to create an input stream from an output device
-            return Err(BuildStreamError::StreamConfigNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device does not support input",
+            ));
         }
-        if conf.sample_rate != self.sample_rate || sample_format != JACK_SAMPLE_FORMAT {
-            return Err(BuildStreamError::StreamConfigNotSupported);
+        crate::validate_stream_config(&conf)?;
+        if sample_format != JACK_SAMPLE_FORMAT {
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedConfig,
+                format!(
+                    "Sample format {sample_format} is not supported; required format is {JACK_SAMPLE_FORMAT}"
+                ),
+            ));
         }
-        self.validate_buffer_size(conf)?;
 
-        // The settings should be fine, create a Client
-        let client_options = super::get_client_options(self.start_server_automatically);
-        let client;
-        match super::get_client(&self.name, client_options) {
-            Ok(c) => client = c,
-            Err(e) => {
-                return Err(BuildStreamError::BackendSpecific {
-                    err: BackendSpecificError { description: e },
-                })
+        // Keep `capture` monotonic: re-patching cpal's ports to a different hardware port
+        // can raise the capture port's latency, pulling `capture` backward.
+        let data_callback = crate::host::monotonic_input_callback(data_callback);
+        let name = self.name.clone();
+        let start_server_automatically = self.start_server_automatically;
+        let connect_ports_automatically = self.connect_ports_automatically;
+
+        let build = move || -> Result<Stream, Error> {
+            let client_options = super::get_client_options(start_server_automatically);
+            let client = super::get_client(&name, client_options)?;
+            if conf.sample_rate != client.sample_rate() {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    format!(
+                        "Sample rate {} Hz does not match the server rate {} Hz",
+                        conf.sample_rate,
+                        client.sample_rate()
+                    ),
+                ));
             }
+            if let BufferSize::Fixed(size) = conf.buffer_size {
+                if size != client.buffer_size() {
+                    return Err(Error::with_message(
+                        ErrorKind::UnsupportedConfig,
+                        format!(
+                            "Buffer size {size} does not match the server buffer size {}",
+                            client.buffer_size()
+                        ),
+                    ));
+                }
+            }
+            let mut stream =
+                Stream::new_input(client, conf.channels, data_callback, error_callback)?;
+            if connect_ports_automatically {
+                stream.connect_to_system_inputs()?;
+            }
+            Ok(stream)
         };
-        let mut stream = Stream::new_input(client, conf.channels, data_callback, error_callback);
 
-        if self.connect_ports_automatically {
-            stream.connect_to_system_inputs();
+        if let Some(dur) = timeout {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(build()).ok();
+            });
+            match rx.recv_timeout(dur) {
+                Ok(result) => result,
+                Err(_) => Err(Error::with_message(
+                    ErrorKind::DeviceNotAvailable,
+                    "timed out waiting for JACK server",
+                )),
+            }
+        } else {
+            build()
         }
-
-        Ok(stream)
     }
 
     fn build_output_stream_raw<D, E>(
         &self,
-        conf: &StreamConfig,
+        conf: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+        timeout: Option<Duration>,
+    ) -> Result<Self::Stream, Error>
     where
-        D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        D: FnMut(&mut Data, &CallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         if self.is_input() {
-            // Trying to create an output stream from an input device
-            return Err(BuildStreamError::StreamConfigNotSupported);
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Device does not support output",
+            ));
         }
-        if conf.sample_rate != self.sample_rate || sample_format != JACK_SAMPLE_FORMAT {
-            return Err(BuildStreamError::StreamConfigNotSupported);
+        crate::validate_stream_config(&conf)?;
+        if sample_format != JACK_SAMPLE_FORMAT {
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedConfig,
+                format!(
+                    "Sample format {sample_format} is not supported; required format is {JACK_SAMPLE_FORMAT}"
+                ),
+            ));
         }
-        self.validate_buffer_size(conf)?;
 
-        // The settings should be fine, create a Client
-        let client_options = super::get_client_options(self.start_server_automatically);
-        let client;
-        match super::get_client(&self.name, client_options) {
-            Ok(c) => client = c,
-            Err(e) => {
-                return Err(BuildStreamError::BackendSpecific {
-                    err: BackendSpecificError { description: e },
-                })
+        // Keep `playback` monotonic: re-patching cpal's ports to a different hardware port
+        // can lower the playback port's latency, pulling `playback` backward.
+        let data_callback = crate::host::monotonic_output_callback(data_callback);
+        let name = self.name.clone();
+        let start_server_automatically = self.start_server_automatically;
+        let connect_ports_automatically = self.connect_ports_automatically;
+
+        let build = move || -> Result<Stream, Error> {
+            // Create a fresh client to validate against live server state.
+            let client_options = super::get_client_options(start_server_automatically);
+            let client = super::get_client(&name, client_options)?;
+            if conf.sample_rate != client.sample_rate() {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    format!(
+                        "Sample rate {} Hz does not match the server rate {} Hz",
+                        conf.sample_rate,
+                        client.sample_rate()
+                    ),
+                ));
             }
+            if let BufferSize::Fixed(size) = conf.buffer_size {
+                if size != client.buffer_size() {
+                    return Err(Error::with_message(
+                        ErrorKind::UnsupportedConfig,
+                        format!(
+                            "Buffer size {size} does not match the server buffer size {}",
+                            client.buffer_size()
+                        ),
+                    ));
+                }
+            }
+            let mut stream =
+                Stream::new_output(client, conf.channels, data_callback, error_callback)?;
+            if connect_ports_automatically {
+                stream.connect_to_system_outputs()?;
+            }
+            Ok(stream)
         };
-        let mut stream = Stream::new_output(client, conf.channels, data_callback, error_callback);
 
-        if self.connect_ports_automatically {
-            stream.connect_to_system_outputs();
+        if let Some(dur) = timeout {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(build()).ok();
+            });
+            match rx.recv_timeout(dur) {
+                Ok(result) => result,
+                Err(_) => Err(Error::with_message(
+                    ErrorKind::DeviceNotAvailable,
+                    "timed out waiting for JACK server",
+                )),
+            }
+        } else {
+            build()
         }
-
-        Ok(stream)
     }
 }
 
@@ -280,6 +374,13 @@ impl PartialEq for Device {
 }
 
 impl Eq for Device {}
+
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let desc = self.description().map_err(|_| fmt::Error)?;
+        f.write_str(desc.name())
+    }
+}
 
 impl Hash for Device {
     fn hash<H: Hasher>(&self, state: &mut H) {

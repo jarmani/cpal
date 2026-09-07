@@ -6,14 +6,10 @@
 //! CPAL handles any necessary conversions when interfacing with hardware that uses
 //! a different byte order.
 
-use std::{fmt::Display, mem};
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
-use wasm_bindgen::prelude::*;
-
-pub use dasp_sample::{FromSample, Sample};
+use std::{
+    fmt::{self, Display},
+    mem,
+};
 
 /// 24-bit signed integer sample type.
 ///
@@ -23,7 +19,6 @@ pub use dasp_sample::{FromSample, Sample};
 /// with the most significant byte unused. Use [`SampleFormat::bits_per_sample`] to get
 /// the actual bit depth (24) vs [`SampleFormat::sample_size`] for storage size (4 bytes).
 pub use dasp_sample::I24;
-
 /// 24-bit unsigned integer sample type.
 ///
 /// Represents 24-bit audio with range `0..=((1 << 24) - 1)`, with origin at `1 << 23 == 8388608`.
@@ -32,6 +27,13 @@ pub use dasp_sample::I24;
 /// with the most significant byte unused. Use [`SampleFormat::bits_per_sample`] to get
 /// the actual bit depth (24) vs [`SampleFormat::sample_size`] for storage size (4 bytes).
 pub use dasp_sample::U24;
+pub use dasp_sample::{FromSample, Sample};
+#[cfg(all(
+    target_arch = "wasm32",
+    target_os = "unknown",
+    feature = "wasm-bindgen"
+))]
+use wasm_bindgen::prelude::*;
 
 // I48 and U48 are not currently supported by cpal but available in dasp_sample:
 // pub use dasp_sample::{I48, U48};
@@ -54,7 +56,8 @@ pub use dasp_sample::U24;
 #[cfg_attr(
     all(
         target_arch = "wasm32",
-        any(target_os = "emscripten", feature = "wasm-bindgen")
+        target_os = "unknown",
+        feature = "wasm-bindgen"
     ),
     wasm_bindgen
 )]
@@ -214,7 +217,7 @@ impl SampleFormat {
 }
 
 impl Display for SampleFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             SampleFormat::I8 => "i8",
             SampleFormat::I16 => "i16",
@@ -251,6 +254,11 @@ impl Display for SampleFormat {
 /// assert_eq!(i16::FORMAT, cpal::SampleFormat::I16);
 /// assert_eq!(f32::FORMAT, cpal::SampleFormat::F32);
 /// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a supported cpal sample type",
+    label = "this type cannot be used as a cpal audio sample",
+    note = "cpal supports: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, I24, U24"
+)]
 pub trait SizedSample: Sample {
     /// The corresponding [`SampleFormat`] for this sample type.
     const FORMAT: SampleFormat;

@@ -1,12 +1,13 @@
 extern crate bindgen;
 extern crate cc;
-extern crate parse_cfg;
 extern crate walkdir;
 
-use parse_cfg::*;
-use std::env;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
 use walkdir::WalkDir;
 
 const CPAL_ASIO_DIR: &str = "CPAL_ASIO_DIR";
@@ -21,33 +22,17 @@ fn host_os_is_windows() -> bool {
     std::env::consts::OS == "windows"
 }
 
-/// Checks if the target env is MSVC
-fn is_msvc() -> bool {
-    let target: Target = std::env::var("TARGET")
-        .expect("Target not set.")
-        .parse()
-        .expect("Unable to parse target.");
-
-    let target_env = match target {
-        Target::Triple { env, .. } => env,
-        Target::Cfg(_) => panic!("cfg targets not supported"),
-    };
-
-    if let Some(env) = target_env {
-        env.contains("msvc")
-    } else {
-        false
-    }
-}
-
 fn main() {
-    // When building on docs.rs, skip the actual build and generate stub bindings
-    if std::env::var("DOCS_RS").is_ok() {
-        println!("cargo:warning=Building for docs.rs - generating stub bindings");
+    // ASIO is Windows-only. Skip build on non-Windows platforms and on docs.rs.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+        || std::env::var("DOCS_RS").is_ok()
+    {
         let out_dir = PathBuf::from(env::var("OUT_DIR").expect("bad path"));
         create_stub_bindings(&out_dir);
         return;
     }
+
+    let is_msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
 
     println!("cargo:rerun-if-env-changed={}", CPAL_ASIO_DIR);
 
@@ -63,13 +48,14 @@ fn main() {
     let mut lib_path = out_dir.clone();
     lib_path.push("libasio.a");
     if !lib_path.exists() {
-        if is_msvc() {
+        if is_msvc {
             invoke_vcvars_if_not_set();
         }
         create_lib(&cpal_asio_dir);
     }
 
     // Print out links to needed libraries
+    println!("cargo:rustc-link-lib=dylib=advapi32");
     println!("cargo:rustc-link-lib=dylib=ole32");
     println!("cargo:rustc-link-lib=dylib=user32");
     println!("cargo:rustc-link-search={}", out_dir.display());
@@ -81,7 +67,7 @@ fn main() {
     let mut binding_path = out_dir.clone();
     binding_path.push("asio_bindings.rs");
     if !binding_path.exists() {
-        if is_msvc() {
+        if is_msvc {
             invoke_vcvars_if_not_set();
         }
         create_bindings(&cpal_asio_dir);
@@ -227,6 +213,7 @@ fn create_bindings(cpal_asio_dir: &PathBuf) {
         .allowlist_function("ASIOGetChannels")
         .allowlist_function("ASIOGetChannelInfo")
         .allowlist_function("ASIOGetBufferSize")
+        .allowlist_function("ASIOGetLatencies")
         .allowlist_function("ASIOGetSamplePosition")
         .allowlist_function("ASIOOutputReady")
         .allowlist_function("get_sample_rate")
@@ -424,7 +411,7 @@ fn invoke_vcvars_if_not_set() {
         // Filters the output of vcvarsall.bat to only include lines of the form "VARNAME=VALUE"
         let parts: Vec<&str> = line.splitn(2, '=').collect();
         if parts.len() == 2 {
-            env::set_var(parts[0], parts[1]);
+            unsafe { env::set_var(parts[0], parts[1]) };
             println!("{}={}", parts[0], parts[1]);
         }
     }

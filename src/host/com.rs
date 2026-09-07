@@ -1,10 +1,11 @@
 //! Handles COM initialization and cleanup.
 
-use super::IoError;
-use std::marker::PhantomData;
+use std::{io::Error as IoError, marker::PhantomData};
 
-use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::{
+    Foundation::RPC_E_CHANGED_MODE,
+    System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
+};
 
 thread_local!(static COM_INITIALIZED: ComInitialized = {
     unsafe {
@@ -49,8 +50,16 @@ impl Drop for ComInitialized {
     }
 }
 
+/// RAII wrapper for COM-allocated wide strings freed with `CoTaskMemFree`.
+pub(super) struct ComString(pub windows::core::PWSTR);
+
+impl Drop for ComString {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.as_ptr() as *mut _)) }
+    }
+}
+
 /// Ensures that COM is initialized in this thread.
-#[inline]
 pub fn com_initialized() {
     COM_INITIALIZED.with(|_| {});
 }

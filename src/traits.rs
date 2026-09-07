@@ -2,16 +2,20 @@
 //!
 //! # Custom Host Implementations
 //!
-//! When implementing custom hosts with the `custom` feature, use the [`assert_stream_send!`](crate::assert_stream_send)
-//! and [`assert_stream_sync!`](crate::assert_stream_sync) macros to verify your `Stream` type meets CPAL's requirements.
+//! When implementing custom hosts with the `custom` feature, your `Device` type must implement
+//! [`DeviceTrait`] and your `Stream` type must implement [`StreamTrait`].
 
-use std::time::Duration;
+use std::{
+    fmt::{Debug, Display},
+    hash::Hash,
+    time::Duration,
+};
 
 use crate::{
-    BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription, DeviceId, DeviceIdError,
-    DeviceNameError, DevicesError, InputCallbackInfo, InputDevices, OutputCallbackInfo,
-    OutputDevices, PauseStreamError, PlayStreamError, SampleFormat, SizedSample, StreamConfig,
-    StreamError, SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
+    BufferSize, CallbackInfo, ChannelCount, Data, DeviceDescription, DeviceId, DuplexCallbackInfo,
+    DuplexStreamConfig, Error, ErrorKind, InputDevices, OutputDevices, SAMPLE_RATE_48K,
+    SAMPLE_RATE_CD, SampleFormat, SampleRate, SizedSample, StreamConfig, StreamInstant,
+    SupportedStreamConfig, SupportedStreamConfigRange,
 };
 
 /// A [`Host`] provides access to the available audio devices on the system.
@@ -47,7 +51,16 @@ pub trait HostTrait {
     /// An iterator yielding all [`Device`](DeviceTrait)s currently available to the host on the system.
     ///
     /// Can be empty if the system does not support audio in general.
-    fn devices(&self) -> Result<Self::Devices, DevicesError>;
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::HostUnavailable`] if the host has become unreachable (e.g. the audio
+    ///   daemon crashed or was stopped).
+    /// - [`ErrorKind::BackendError`] for unclassifiable backend failures.
+    ///
+    /// [`ErrorKind::HostUnavailable`]: crate::ErrorKind::HostUnavailable
+    /// [`ErrorKind::BackendError`]: crate::ErrorKind::BackendError
+    fn devices(&self) -> Result<Self::Devices, Error>;
 
     /// Fetches a [`Device`](DeviceTrait) based on a [`DeviceId`] if available
     ///
@@ -61,18 +74,38 @@ pub trait HostTrait {
     /// The default input audio device on the system.
     ///
     /// Returns `None` if no input device is available.
+    ///
+    /// Some backends reroute a stream built from this device to the new default device when it
+    /// changes; capture continues there, and [`ErrorKind::DeviceChanged`] is reported. Other
+    /// backends report [`ErrorKind::DeviceNotAvailable`] instead, and the caller must rebuild the
+    /// stream.
+    ///
+    /// [`ErrorKind::DeviceChanged`]: crate::ErrorKind::DeviceChanged
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
     fn default_input_device(&self) -> Option<Self::Device>;
 
     /// The default output audio device on the system.
     ///
     /// Returns `None` if no output device is available.
+    ///
+    /// Some backends reroute a stream built from this device to the new default device when it
+    /// changes; playback continues there, and [`ErrorKind::DeviceChanged`] is reported. Other
+    /// backends report [`ErrorKind::DeviceNotAvailable`] instead, and the caller must rebuild the
+    /// stream.
+    ///
+    /// [`ErrorKind::DeviceChanged`]: crate::ErrorKind::DeviceChanged
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
     fn default_output_device(&self) -> Option<Self::Device>;
 
     /// An iterator yielding all `Device`s currently available to the system that support one or more
     /// input stream formats.
     ///
     /// Can be empty if the system does not support audio input.
-    fn input_devices(&self) -> Result<InputDevices<Self::Devices>, DevicesError> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`devices`](Self::devices).
+    fn input_devices(&self) -> Result<InputDevices<Self::Devices>, Error> {
         Ok(self.devices()?.filter(DeviceTrait::supports_input))
     }
 
@@ -80,7 +113,11 @@ pub trait HostTrait {
     /// output stream formats.
     ///
     /// Can be empty if the system does not support audio output.
-    fn output_devices(&self) -> Result<OutputDevices<Self::Devices>, DevicesError> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`devices`](Self::devices).
+    fn output_devices(&self) -> Result<OutputDevices<Self::Devices>, Error> {
         Ok(self.devices()?.filter(DeviceTrait::supports_output))
     }
 }
@@ -89,27 +126,18 @@ pub trait HostTrait {
 ///
 /// Please note that `Device`s may become invalid if they get disconnected. Therefore, all the
 /// methods that involve a device return a `Result` allowing the user to handle this case.
-pub trait DeviceTrait {
+pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display + Send + Sync {
     /// The iterator type yielding supported input stream formats.
     type SupportedInputConfigs: Iterator<Item = SupportedStreamConfigRange>;
     /// The iterator type yielding supported output stream formats.
     type SupportedOutputConfigs: Iterator<Item = SupportedStreamConfigRange>;
-    /// The stream type created by [`build_input_stream_raw`] and [`build_output_stream_raw`].
+    /// The stream type created by [`build_input_stream_raw`] and [`build_output_stream_raw`],
+    /// and [`build_duplex_stream_raw`].
     ///
     /// [`build_input_stream_raw`]: Self::build_input_stream_raw
     /// [`build_output_stream_raw`]: Self::build_output_stream_raw
+    /// [`build_duplex_stream_raw`]: Self::build_duplex_stream_raw
     type Stream: StreamTrait;
-
-    /// The human-readable name of the device.
-    #[deprecated(
-        since = "0.17.0",
-        note = "Use `description()` for comprehensive device information including name, \
-                manufacturer, and device type. Use `id()` for a unique, stable device identifier \
-                that persists across reboots and reconnections."
-    )]
-    fn name(&self) -> Result<String, DeviceNameError> {
-        self.description().map(|desc| desc.name().to_string())
-    }
 
     /// Structured description of the device with metadata.
     ///
@@ -117,15 +145,27 @@ pub trait DeviceTrait {
     /// including name, manufacturer (if available), device type, bus type, and other
     /// platform-specific metadata.
     ///
-    /// For simple string representation, use `device.description().to_string()` or
-    /// `device.description().name()`.
-    fn description(&self) -> Result<DeviceDescription, DeviceNameError>;
+    /// For the device name as a string, use `device.to_string()` or format it with `{}`. For the
+    /// full structured description, call `device.description()?` and format or inspect that.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    fn description(&self) -> Result<DeviceDescription, Error>;
 
     /// The ID of the device.
     ///
     /// This ID uniquely identifies the device on the host. It should be stable across program
     /// runs, device disconnections, and system reboots where possible.
-    fn id(&self) -> Result<DeviceId, DeviceIdError>;
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    fn id(&self) -> Result<DeviceId, Error>;
 
     /// True if the device supports audio input, otherwise false
     fn supports_input(&self) -> bool {
@@ -139,25 +179,185 @@ pub trait DeviceTrait {
             .is_ok_and(|mut iter| iter.next().is_some())
     }
 
-    /// An iterator yielding formats that are supported by the backend.
+    /// True if the device supports audio input and output from one device-level callback,
+    /// otherwise false
     ///
-    /// Can return an error if the device is no longer valid (e.g. it has been disconnected).
-    fn supported_input_configs(
-        &self,
-    ) -> Result<Self::SupportedInputConfigs, SupportedStreamConfigsError>;
+    /// This is stricter than [`DeviceDirection::Duplex`](crate::DeviceDirection::Duplex), which
+    /// only means the device has both directions.
+    fn supports_duplex(&self) -> bool {
+        false
+    }
 
-    /// An iterator yielding output stream formats that are supported by the device.
+    /// An iterator yielding input stream configurations that are supported by the device.
     ///
-    /// Can return an error if the device is no longer valid (e.g. it has been disconnected).
-    fn supported_output_configs(
-        &self,
-    ) -> Result<Self::SupportedOutputConfigs, SupportedStreamConfigsError>;
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::UnsupportedConfig`] if the backend could not determine what the device
+    ///   supports.
+    /// - [`ErrorKind::UnsupportedOperation`] if the device does not support input.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error>;
 
-    /// The default input stream format for the device.
-    fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError>;
+    /// An iterator yielding output stream configurations that are supported by the device.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::UnsupportedConfig`] if the backend could not determine what the device
+    ///   supports.
+    /// - [`ErrorKind::UnsupportedOperation`] if the device does not support output.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error>;
 
-    /// The default output stream format for the device.
-    fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError>;
+    /// The default input stream configuration for the device.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::UnsupportedConfig`] if the device has no default input configuration.
+    /// - [`ErrorKind::UnsupportedOperation`] if the device does not support input.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    fn default_input_config(&self) -> Result<SupportedStreamConfig, Error>;
+
+    /// The default output stream configuration for the device.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::UnsupportedConfig`] if the device has no default output configuration.
+    /// - [`ErrorKind::UnsupportedOperation`] if the device does not support output.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    fn default_output_config(&self) -> Result<SupportedStreamConfig, Error>;
+
+    /// The default duplex stream configuration for the device.
+    ///
+    /// A duplex stream drives both directions at one sample rate, so the default implementation
+    /// picks a rate that both support, preferring one returned by
+    /// [`default_input_config`](Self::default_input_config) or
+    /// [`default_output_config`](Self::default_output_config). Channel counts are independent, so
+    /// each direction keeps its own default count where that rate allows it: a mono microphone
+    /// paired with stereo output gives one input channel and two output channels.
+    ///
+    /// The result is built from what each direction reports on its own. A device whose two
+    /// directions cannot both run at their full capability may still reject the configuration in
+    /// [`build_duplex_stream`](Self::build_duplex_stream).
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::UnsupportedConfig`] if no sample rate is supported by both directions.
+    /// - [`ErrorKind::UnsupportedOperation`] if the host or device does not support duplex
+    ///   streams.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    fn default_duplex_config(&self) -> Result<DuplexStreamConfig, Error> {
+        if !self.supports_duplex() {
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "duplex streams are not supported by this device",
+            ));
+        }
+
+        let inputs: Vec<_> = self.supported_input_configs()?.collect();
+        let outputs: Vec<_> = self.supported_output_configs()?.collect();
+        let default_input = self.default_input_config().ok();
+        let default_output = self.default_output_config().ok();
+
+        let mut candidate_rates: Vec<SampleRate> = [
+            default_input.map(|c| c.sample_rate()),
+            default_output.map(|c| c.sample_rate()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        candidate_rates.dedup();
+        candidate_rates.sort_unstable_by(|a, b| b.cmp(a));
+        for rate in [SAMPLE_RATE_48K, SAMPLE_RATE_CD] {
+            if !candidate_rates.contains(&rate) {
+                candidate_rates.push(rate);
+            }
+        }
+
+        let overlaps = |rate: SampleRate| {
+            inputs.iter().any(|r| r.contains_rate(rate))
+                && outputs.iter().any(|r| r.contains_rate(rate))
+        };
+        let sample_rate = candidate_rates
+            .iter()
+            .copied()
+            .find(|&rate| overlaps(rate))
+            .or_else(|| {
+                // Otherwise take the highest rate at which the two directions overlap.
+                inputs
+                    .iter()
+                    .flat_map(|i| {
+                        outputs.iter().filter_map(move |o| {
+                            let hi = i.max_sample_rate.min(o.max_sample_rate);
+                            (i.min_sample_rate.max(o.min_sample_rate) <= hi).then_some(hi)
+                        })
+                    })
+                    .max()
+            })
+            .ok_or_else(|| {
+                Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    "no sample rate is supported by both input and output",
+                )
+            })?;
+
+        // Keep the direction's own default channel count if it is available at the chosen rate,
+        // since that is what a stream in this direction alone would have used.
+        let best_channels = |configs: &[SupportedStreamConfigRange],
+                             preferred: Option<ChannelCount>,
+                             none_supported_message| {
+            preferred
+                .filter(|&channels| {
+                    configs
+                        .iter()
+                        .any(|r| r.channels() == channels && r.contains_rate(sample_rate))
+                })
+                .or_else(|| {
+                    configs
+                        .iter()
+                        .filter(|r| r.contains_rate(sample_rate))
+                        .max_by(|a, b| a.cmp_default_heuristics(b))
+                        .map(|r| r.channels())
+                })
+                .ok_or_else(|| {
+                    Error::with_message(ErrorKind::UnsupportedConfig, none_supported_message)
+                })
+        };
+
+        Ok(DuplexStreamConfig {
+            input_channels: best_channels(
+                &inputs,
+                default_input.map(|c| c.channels()),
+                "no supported input configuration",
+            )?,
+            output_channels: best_channels(
+                &outputs,
+                default_output.map(|c| c.channels()),
+                "no supported output configuration",
+            )?,
+            sample_rate,
+            buffer_size: BufferSize::Default,
+        })
+    }
 
     /// Create an input stream.
     ///
@@ -165,21 +365,40 @@ pub trait DeviceTrait {
     ///
     /// * `config` - The stream configuration including sample rate, channels, and buffer size.
     /// * `data_callback` - Called periodically with captured audio data. The callback receives
-    ///   a slice of samples in the format `T` and timing information.
+    ///   a slice of samples in the format `T` and timing information. It is real-time code: see
+    ///   the [crate documentation](crate) for what you must not do in it.
     /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
-    /// * `timeout` - Optional timeout for backend operations. `None` indicates blocking behavior,
-    ///   `Some(duration)` sets a maximum wait time. Not all backends support timeouts.
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::UnsupportedConfig`] if the sample rate, channel count, buffer size, or
+    ///   sample format is not supported by the device.
+    /// - [`ErrorKind::UnsupportedOperation`] if the device does not support input streams.
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::DeviceBusy`] if the device is temporarily in use by another application.
+    /// - [`ErrorKind::PermissionDenied`] if the process lacks permission to access the device.
+    /// - [`ErrorKind::InvalidInput`] if the configuration parameters are invalid.
+    ///
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
+    /// [`ErrorKind::PermissionDenied`]: crate::ErrorKind::PermissionDenied
+    /// [`ErrorKind::InvalidInput`]: crate::ErrorKind::InvalidInput
     fn build_input_stream<T, D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         mut data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
         T: SizedSample,
-        D: FnMut(&[T], &InputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        D: FnMut(&[T], &CallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         self.build_input_stream_raw(
             config,
@@ -203,21 +422,41 @@ pub trait DeviceTrait {
     /// * `config` - The stream configuration including sample rate, channels, and buffer size.
     /// * `data_callback` - Called periodically to fill the output buffer. The callback receives
     ///   a mutable slice of samples in the format `T` to be filled with audio data, along with
-    ///   timing information.
+    ///   timing information. The slice is pre-filled with silence, so a callback that writes
+    ///   fewer samples than the slice holds leaves the remainder silent rather than stale. It is
+    ///   real-time code: see the [crate documentation](crate) for what you must not do in it.
     /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
-    /// * `timeout` - Optional timeout for backend operations. `None` indicates blocking behavior,
-    ///   `Some(duration)` sets a maximum wait time. Not all backends support timeouts.
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::UnsupportedConfig`] if the sample rate, channel count, buffer size, or
+    ///   sample format is not supported by the device.
+    /// - [`ErrorKind::UnsupportedOperation`] if the device does not support output streams.
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::DeviceBusy`] if the device is temporarily in use by another application.
+    /// - [`ErrorKind::PermissionDenied`] if the process lacks permission to access the device.
+    /// - [`ErrorKind::InvalidInput`] if the configuration parameters are invalid.
+    ///
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
+    /// [`ErrorKind::PermissionDenied`]: crate::ErrorKind::PermissionDenied
+    /// [`ErrorKind::InvalidInput`]: crate::ErrorKind::InvalidInput
     fn build_output_stream<T, D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         mut data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
         T: SizedSample,
-        D: FnMut(&mut [T], &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        D: FnMut(&mut [T], &CallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         self.build_output_stream_raw(
             config,
@@ -244,21 +483,40 @@ pub trait DeviceTrait {
     ///
     /// * `config` - The stream configuration including sample rate, channels, and buffer size.
     /// * `sample_format` - The sample format of the audio data.
-    /// * `data_callback` - Called periodically with captured audio data as a [`Data`] buffer.
+    /// * `data_callback` - Called periodically with captured audio data as a [`Data`] buffer. It
+    ///   is real-time code: see the [crate documentation](crate) for what you must not do in it.
     /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
-    /// * `timeout` - Optional timeout for backend operations. `None` indicates blocking behavior,
-    ///   `Some(duration)` sets a maximum wait time. Not all backends support timeouts.
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::UnsupportedConfig`] if the sample rate, channel count, buffer size, or
+    ///   sample format is not supported by the device.
+    /// - [`ErrorKind::UnsupportedOperation`] if the device does not support input streams.
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::DeviceBusy`] if the device is temporarily in use by another application.
+    /// - [`ErrorKind::PermissionDenied`] if the process lacks permission to access the device.
+    /// - [`ErrorKind::InvalidInput`] if the configuration parameters are invalid.
+    ///
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
+    /// [`ErrorKind::PermissionDenied`]: crate::ErrorKind::PermissionDenied
+    /// [`ErrorKind::InvalidInput`]: crate::ErrorKind::InvalidInput
     fn build_input_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
-        D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static;
+        D: FnMut(&Data, &CallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static;
 
     /// Create a dynamically typed output stream.
     ///
@@ -271,51 +529,269 @@ pub trait DeviceTrait {
     /// * `config` - The stream configuration including sample rate, channels, and buffer size.
     /// * `sample_format` - The sample format of the audio data.
     /// * `data_callback` - Called periodically to fill the output buffer with audio data as
-    ///   a mutable [`Data`] buffer.
+    ///   a mutable [`Data`] buffer. The buffer is pre-filled with silence, so a callback that
+    ///   writes fewer samples than the buffer holds leaves the remainder silent rather than stale.
+    ///   It is real-time code: see the [crate documentation](crate) for what you must not do in it.
     /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
-    /// * `timeout` - Optional timeout for backend operations. `None` indicates blocking behavior,
-    ///   `Some(duration)` sets a maximum wait time. Not all backends support timeouts.
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::UnsupportedConfig`] if the sample rate, channel count, buffer size, or
+    ///   sample format is not supported by the device.
+    /// - [`ErrorKind::UnsupportedOperation`] if the device does not support output streams.
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::DeviceBusy`] if the device is temporarily in use by another application.
+    /// - [`ErrorKind::PermissionDenied`] if the process lacks permission to access the device.
+    /// - [`ErrorKind::InvalidInput`] if the configuration parameters are invalid.
+    ///
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
+    /// [`ErrorKind::PermissionDenied`]: crate::ErrorKind::PermissionDenied
+    /// [`ErrorKind::InvalidInput`]: crate::ErrorKind::InvalidInput
     fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
-        D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static;
+        D: FnMut(&mut Data, &CallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static;
+
+    /// Create a duplex stream that captures input and renders output from one device-level
+    /// callback.
+    ///
+    /// cpal does not compensate for drift between the two directions, and does not mix or remap
+    /// channels between them.
+    ///
+    /// # Parameters
+    ///
+    /// * `config` - Channels, sample rate, and buffer size shared by both directions.
+    /// * `data_callback` - Called periodically with captured input and a mutable output buffer. It
+    ///   is real-time code: see the [crate documentation](crate) for what you must not do in it.
+    /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::UnsupportedOperation`] if the host or device does not support duplex
+    ///   streams.
+    /// - [`ErrorKind::UnsupportedConfig`] if the sample rate, channel counts, buffer size, or
+    ///   sample format is not supported by the device.
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::DeviceBusy`] if the device is temporarily in use by another application.
+    /// - [`ErrorKind::PermissionDenied`] if the process lacks permission to access the device
+    ///   (e.g. microphone access on macOS).
+    /// - [`ErrorKind::InvalidInput`] if the configuration parameters are invalid.
+    /// - [`ErrorKind::StreamInvalidated`] if the device's sample rate or buffer size changed
+    ///   during stream creation, or an internal lock was poisoned.
+    /// - [`ErrorKind::ResourceExhausted`] if the host fails to spawn an internal monitoring
+    ///   thread.
+    /// - [`ErrorKind::BackendError`] for unclassified backend failures.
+    ///
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
+    /// [`ErrorKind::PermissionDenied`]: crate::ErrorKind::PermissionDenied
+    /// [`ErrorKind::InvalidInput`]: crate::ErrorKind::InvalidInput
+    /// [`ErrorKind::StreamInvalidated`]: crate::ErrorKind::StreamInvalidated
+    /// [`ErrorKind::ResourceExhausted`]: crate::ErrorKind::ResourceExhausted
+    /// [`ErrorKind::BackendError`]: crate::ErrorKind::BackendError
+    fn build_duplex_stream<I, O, D, E>(
+        &self,
+        config: DuplexStreamConfig,
+        mut data_callback: D,
+        error_callback: E,
+        timeout: Option<Duration>,
+    ) -> Result<Self::Stream, Error>
+    where
+        I: SizedSample,
+        O: SizedSample,
+        D: FnMut(&[I], &mut [O], &DuplexCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        self.build_duplex_stream_raw(
+            config,
+            I::FORMAT,
+            O::FORMAT,
+            move |input, output, info| {
+                data_callback(
+                    input
+                        .as_slice()
+                        .expect("host supplied incorrect sample type"),
+                    output
+                        .as_slice_mut()
+                        .expect("host supplied incorrect sample type"),
+                    info,
+                )
+            },
+            error_callback,
+            timeout,
+        )
+    }
+
+    /// Create a dynamically typed synchronized duplex stream.
+    ///
+    /// Hosts that support duplex streams must override this method;
+    /// the default implementation returns [`ErrorKind::UnsupportedOperation`].
+    ///
+    /// See [`build_duplex_stream`](Self::build_duplex_stream) for parameter and error
+    /// documentation.
+    ///
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    fn build_duplex_stream_raw<D, E>(
+        &self,
+        _config: DuplexStreamConfig,
+        _input_sample_format: SampleFormat,
+        _output_sample_format: SampleFormat,
+        _data_callback: D,
+        _error_callback: E,
+        _timeout: Option<Duration>,
+    ) -> Result<Self::Stream, Error>
+    where
+        D: FnMut(&Data, &mut Data, &DuplexCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        Err(Error::with_message(
+            ErrorKind::UnsupportedOperation,
+            "duplex streams are not supported by this device",
+        ))
+    }
 }
 
-/// A stream created from [`Device`](DeviceTrait), with methods to control playback.
-pub trait StreamTrait {
-    /// Run the stream.
+/// A stream created from [`Device`](DeviceTrait), with methods to control it.
+pub trait StreamTrait: Send + Sync {
+    /// Start (or resume) the stream.
     ///
-    /// Note: Not all platforms automatically run the stream upon creation, so it is important to
-    /// call `play` after creation if it is expected that the stream should run immediately.
-    fn play(&self) -> Result<(), PlayStreamError>;
+    /// Streams returned by `build_*_stream` are always stopped, so `start` must be called before
+    /// the data callback will fire.
+    ///
+    /// `start` also resumes a stream that was halted with [`pause`](Self::pause) or
+    /// [`stop`](Self::stop): after a [`stop`](Self::stop) the backend re-prepares the device as
+    /// needed, so the same stream can be cycled through start/stop without being rebuilt.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::StreamInvalidated`] if the stream configuration has changed and the stream
+    ///   must be rebuilt.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::StreamInvalidated`]: crate::ErrorKind::StreamInvalidated
+    fn start(&self) -> Result<(), Error>;
 
-    /// Some devices support pausing the audio stream. This can be useful for saving energy in
-    /// moments of silence.
+    /// Deprecated alias for [`start`](Self::start).
+    #[deprecated(since = "0.19.0", note = "renamed to `start`")]
+    fn play(&self) -> Result<(), Error> {
+        self.start()
+    }
+
+    /// Pause the stream, halting the data callback as soon as possible.
     ///
-    /// Note: Not all devices support suspending the stream at the hardware level. This method may
-    /// fail in these cases.
-    fn pause(&self) -> Result<(), PauseStreamError>;
+    /// Pausing halts audio immediately without waiting for buffered output to finish. On backends
+    /// that support hardware-level suspend, frames already queued in the device are preserved and
+    /// resume playing after the next [`start`](Self::start); on other backends the buffer may be
+    /// flushed. To let buffered audio play out before halting, use [`stop`](Self::stop) instead. A
+    /// paused stream is resumed with [`start`](Self::start).
+    ///
+    /// Some devices support suspending at the hardware level (saving energy); others stop only the
+    /// data callback while the hardware keeps running.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::UnsupportedOperation`] if the backend does not support pausing this stream.
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::StreamInvalidated`] if the stream configuration has changed and the stream
+    ///   must be rebuilt.
+    ///
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::StreamInvalidated`]: crate::ErrorKind::StreamInvalidated
+    fn pause(&self) -> Result<(), Error>;
+
+    /// Stop the stream gracefully, draining buffered audio before halting.
+    ///
+    /// Unlike [`pause`](Self::pause), `stop` lets audio that has already been buffered finish:
+    /// on an output stream it blocks the calling thread until the device has played out its queued
+    /// frames (or `timeout` elapses), then halts.
+    ///
+    /// The stream remains valid after `stop`; calling [`start`](Self::start) again resumes it,
+    /// re-preparing the device if the backend requires it.
+    ///
+    /// # Parameters
+    ///
+    /// * `timeout` - How long to wait for buffered audio to drain. `None` waits until the drain
+    ///   completes; `Some(duration)` halts after the duration even if frames remain;
+    ///   `Some(Duration::ZERO)` halts immediately. Independent of the timeout passed to
+    ///   `build_*_stream`.
+    ///
+    /// # Backend support
+    ///
+    /// Draining is only meaningful for output streams. Backends may drain natively or approximate
+    /// it by sleeping for an estimated buffer depth; if a backend has no drain support at all,
+    /// `stop` halts immediately like `pause`. On input (capture) streams, `stop` always halts
+    /// immediately and `timeout` is ignored.
+    ///
+    /// Dropping a stream without calling `stop` halts it immediately, without draining.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::StreamInvalidated`] if the stream configuration has changed and the stream
+    ///   must be rebuilt.
+    ///
+    /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::StreamInvalidated`]: crate::ErrorKind::StreamInvalidated
+    fn stop(&self, timeout: Option<Duration>) -> Result<(), Error>;
+
+    /// Returns the backend's best available estimate of the number of frames per callback.
+    ///
+    /// The value is available immediately after stream creation: for fixed buffer sizes this is
+    /// the negotiated hardware size; for default buffer sizes this is the backend's configured
+    /// default. The value is updated when it changes during the lifetime of the stream.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::UnsupportedOperation`] if the backend cannot query the buffer size.
+    /// - [`ErrorKind::BackendError`] for unclassifiable backend failures.
+    ///
+    /// # Implementation notes
+    ///
+    /// It is not enforced that each callback delivers exactly this many frames. The actual frame
+    /// count for each callback is given by its buffer.
+    ///
+    /// `buffer_size()` is primarily intended for sizing pre-allocated buffers, but must not be
+    /// trusted as a guaranteed bound. An incorrect implementation of `buffer_size()` should not
+    /// lead to memory safety violations.
+    ///
+    /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
+    /// [`ErrorKind::BackendError`]: crate::ErrorKind::BackendError
+    fn buffer_size(&self) -> Result<crate::FrameCount, Error>;
+
+    /// Returns a [`StreamInstant`] representing the current moment on the stream's clock.
+    ///
+    /// The clock is **monotonic**: successive calls to `now()` will never return a value earlier
+    /// than a previous one, and the returned value will never be earlier than any `callback`,
+    /// `capture`, or `playback` instant already delivered to the stream's data callback.
+    ///
+    /// The returned value shares the same time base as the [`StreamInstant`]s delivered to the
+    /// stream's data callback via [`crate::StreamTimestamp::callback`] and
+    /// [`crate::StreamTimestamp::callback`], so durations between them are meaningful.
+    fn now(&self) -> StreamInstant;
 }
 
 /// Compile-time assertion that a stream type implements [`Send`].
-///
-/// Custom host implementations should use this macro to verify their `Stream` type
-/// can be safely transferred between threads, as required by CPAL's API.
-///
-/// # Example
-///
-/// ```
-/// use cpal::assert_stream_send;
-/// struct MyStream { /* ... */ }
-/// assert_stream_send!(MyStream);
-/// ```
+#[deprecated(since = "0.19.0", note = "StreamTrait now requires Send + Sync")]
 #[macro_export]
 macro_rules! assert_stream_send {
     ($t:ty) => {
@@ -325,17 +801,7 @@ macro_rules! assert_stream_send {
 }
 
 /// Compile-time assertion that a stream type implements [`Sync`].
-///
-/// Custom host implementations should use this macro to verify their `Stream` type
-/// can be safely shared between threads, as required by CPAL's API.
-///
-/// # Example
-///
-/// ```
-/// use cpal::assert_stream_sync;
-/// struct MyStream { /* ... */ }
-/// assert_stream_sync!(MyStream);
-/// ```
+#[deprecated(since = "0.19.0", note = "StreamTrait now requires Send + Sync")]
 #[macro_export]
 macro_rules! assert_stream_sync {
     ($t:ty) => {

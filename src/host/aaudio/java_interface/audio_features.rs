@@ -1,15 +1,14 @@
 use super::{
-    utils::{
-        get_context, get_package_manager, has_system_feature, with_attached, JNIEnv, JObject,
-        JResult,
-    },
     PackageManager,
+    utils::{
+        Env, JObject, JResult, get_context, get_package_manager, has_system_feature, with_attached,
+    },
 };
 
 /**
  * The Android audio features
  */
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub enum AudioFeature {
     LowLatency,
     Output,
@@ -46,7 +45,7 @@ impl AudioFeature {
 }
 
 fn try_check_system_feature<'j>(
-    env: &mut JNIEnv<'j>,
+    env: &mut Env<'j>,
     activity: &JObject<'j>,
     feature: &str,
 ) -> JResult<bool> {
