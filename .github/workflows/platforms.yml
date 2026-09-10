@@ -218,6 +218,36 @@ jobs:
       - name: Check examples (all features)
         run: cargo +nightly check --examples --all-features --workspace --verbose --target ${{ env.TARGET }} -Z build-std
 
+  # OpenBSD (sndio)
+  openbsd:
+    name: openbsd-x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run tests in OpenBSD
+        uses: vmactions/openbsd-vm@86cdc08415d9d0865267e686561e276c52d62530 # v1.4.7
+        with:
+          release: "7.9"
+          arch: x86_64
+          mem: 4096
+          cpu: 2
+          copyback: false
+          cache-after-prepare: true
+          prepare: |
+            pkg_add rust
+          run: |
+            set -eu
+            rustc --version
+            cargo --version
+            cargo test --workspace --verbose
+            cargo check --examples --workspace --verbose
+            cargo test --no-default-features --workspace --verbose
+            cargo check --examples --no-default-features --workspace --verbose
+            cargo test --all-features --workspace --verbose
+            cargo check --examples --all-features --workspace --verbose
+
   # Windows (x86_64 and i686)
   windows:
     strategy:
@@ -622,6 +652,7 @@ jobs:
       - linux-armv7
       - macos
       - mipsel
+      - openbsd
       - pipewire-bookworm
       - tvos
       - wasm-audioworklet
