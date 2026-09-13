@@ -9,11 +9,9 @@ use std::time::{Duration, Instant};
 
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
-    BufferSize, CallbackInfo, Data, DeviceDescription,
-    DeviceDescriptionBuilder, DeviceId, Error, ErrorKind, FrameCount, I24,
-    SampleFormat, StreamConfig, StreamInstant, StreamTimestamp,
-    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
-    U24,
+    BufferSize, CallbackInfo, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error,
+    ErrorKind, FrameCount, I24, SampleFormat, StreamConfig, StreamInstant, StreamTimestamp,
+    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange, U24,
 };
 
 use dasp_sample::{FromSample, Sample};
@@ -87,16 +85,14 @@ impl Device {
     fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
         let config = match default_input_par() {
             Ok(par) => {
-                let channels =
-                    if par.rchan == 0 { 1 } else { par.rchan as u16 };
+                let channels = if par.rchan == 0 { 1 } else { par.rchan as u16 };
                 let rate = if par.rate == 0 { 44_100 } else { par.rate };
-                let sample_format =
-                    sample_format_from_par(&par).ok_or_else(|| {
-                        Error::with_message(
-                            ErrorKind::UnsupportedConfig,
-                            "sndio returned an unsupported input sample format",
-                        )
-                    })?;
+                let sample_format = sample_format_from_par(&par).ok_or_else(|| {
+                    Error::with_message(
+                        ErrorKind::UnsupportedConfig,
+                        "sndio returned an unsupported input sample format",
+                    )
+                })?;
                 SupportedStreamConfigRange::new(
                     channels,
                     rate,
@@ -110,13 +106,10 @@ impl Device {
         Ok(vec![config].into_iter())
     }
 
-    fn supported_output_configs(
-        &self,
-    ) -> Result<SupportedOutputConfigs, Error> {
+    fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
         let config = match default_device_par() {
             Ok(par) => {
-                let channels =
-                    if par.pchan == 0 { 1 } else { par.pchan as u16 };
+                let channels = if par.pchan == 0 { 1 } else { par.pchan as u16 };
                 let rate = if par.rate == 0 { 44_100 } else { par.rate };
                 let sample_format = sample_format_from_par(&par).ok_or_else(|| {
                     Error::with_message(
@@ -202,15 +195,11 @@ impl DeviceTrait for Device {
         Device::id(self)
     }
 
-    fn supported_input_configs(
-        &self,
-    ) -> Result<Self::SupportedInputConfigs, Error> {
+    fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
         Device::supported_input_configs(self)
     }
 
-    fn supported_output_configs(
-        &self,
-    ) -> Result<Self::SupportedOutputConfigs, Error> {
+    fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
         Device::supported_output_configs(self)
     }
 
@@ -239,8 +228,7 @@ impl DeviceTrait for Device {
             .ok_or_else(|| Error::new(ErrorKind::UnsupportedConfig))?;
 
         let mut hdl = open_capture_handle()?;
-        let (par, buffer_frames) =
-            configure_handle(&mut hdl, &config, sample_info, true)?;
+        let (par, buffer_frames) = configure_handle(&mut hdl, &config, sample_info, true)?;
 
         let inner = Arc::new(StreamInner {
             hdl: Mutex::new(hdl),
@@ -261,9 +249,7 @@ impl DeviceTrait for Device {
         let thread_inner = Arc::clone(&inner);
         let join_handle = thread::Builder::new()
             .name("cpal-sndio-input".to_string())
-            .spawn(move || {
-                input_loop(thread_inner, data_callback, error_callback)
-            })
+            .spawn(move || input_loop(thread_inner, data_callback, error_callback))
             .map_err(|err| {
                 Error::with_message(
                     ErrorKind::ResourceExhausted,
@@ -292,8 +278,7 @@ impl DeviceTrait for Device {
             .ok_or_else(|| Error::new(ErrorKind::UnsupportedConfig))?;
 
         let mut hdl = open_playback_handle()?;
-        let (par, buffer_frames) =
-            configure_handle(&mut hdl, &config, sample_info, false)?;
+        let (par, buffer_frames) = configure_handle(&mut hdl, &config, sample_info, false)?;
 
         let inner = Arc::new(StreamInner {
             hdl: Mutex::new(hdl),
@@ -314,9 +299,7 @@ impl DeviceTrait for Device {
         let thread_inner = Arc::clone(&inner);
         let join_handle = thread::Builder::new()
             .name("cpal-sndio-output".to_string())
-            .spawn(move || {
-                output_loop(thread_inner, data_callback, error_callback)
-            })
+            .spawn(move || output_loop(thread_inner, data_callback, error_callback))
             .map_err(|err| {
                 Error::with_message(
                     ErrorKind::ResourceExhausted,
@@ -423,161 +406,104 @@ impl Iterator for Devices {
     }
 }
 
-fn output_loop<D, E>(
-    inner: Arc<StreamInner>,
-    mut data_callback: D,
-    mut error_callback: E,
-) where
+fn output_loop<D, E>(inner: Arc<StreamInner>, mut data_callback: D, mut error_callback: E)
+where
     D: FnMut(&mut Data, &CallbackInfo) + Send + 'static,
     E: FnMut(Error) + Send + 'static,
 {
     match inner.sample_format {
-        SampleFormat::I8 => output_loop_typed::<i8, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U8 => output_loop_typed::<u8, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::I16 => output_loop_typed::<i16, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U16 => output_loop_typed::<u16, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::I24 => output_loop_typed::<I24, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U24 => output_loop_typed::<U24, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::I32 => output_loop_typed::<i32, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U32 => output_loop_typed::<u32, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::F32 => output_loop_typed::<f32, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::I64 => output_loop_typed::<i64, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U64 => output_loop_typed::<u64, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::F64 => output_loop_typed::<f64, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
+        SampleFormat::I8 => {
+            output_loop_typed::<i8, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U8 => {
+            output_loop_typed::<u8, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I16 => {
+            output_loop_typed::<i16, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U16 => {
+            output_loop_typed::<u16, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I24 => {
+            output_loop_typed::<I24, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U24 => {
+            output_loop_typed::<U24, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I32 => {
+            output_loop_typed::<i32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U32 => {
+            output_loop_typed::<u32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::F32 => {
+            output_loop_typed::<f32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I64 => {
+            output_loop_typed::<i64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U64 => {
+            output_loop_typed::<u64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::F64 => {
+            output_loop_typed::<f64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
         _ => {
             error_callback(ErrorKind::StreamInvalidated.into());
         }
     }
 }
 
-fn input_loop<D, E>(
-    inner: Arc<StreamInner>,
-    mut data_callback: D,
-    mut error_callback: E,
-) where
+fn input_loop<D, E>(inner: Arc<StreamInner>, mut data_callback: D, mut error_callback: E)
+where
     D: FnMut(&Data, &CallbackInfo) + Send + 'static,
     E: FnMut(Error) + Send + 'static,
 {
     match inner.sample_format {
-        SampleFormat::I8 => input_loop_typed::<i8, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U8 => input_loop_typed::<u8, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::I16 => input_loop_typed::<i16, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U16 => input_loop_typed::<u16, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::I24 => input_loop_typed::<I24, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U24 => input_loop_typed::<U24, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::I32 => input_loop_typed::<i32, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U32 => input_loop_typed::<u32, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::F32 => input_loop_typed::<f32, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::I64 => input_loop_typed::<i64, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::U64 => input_loop_typed::<u64, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
-        SampleFormat::F64 => input_loop_typed::<f64, _, _>(
-            inner,
-            &mut data_callback,
-            &mut error_callback,
-        ),
+        SampleFormat::I8 => {
+            input_loop_typed::<i8, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U8 => {
+            input_loop_typed::<u8, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I16 => {
+            input_loop_typed::<i16, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U16 => {
+            input_loop_typed::<u16, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I24 => {
+            input_loop_typed::<I24, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U24 => {
+            input_loop_typed::<U24, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I32 => {
+            input_loop_typed::<i32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U32 => {
+            input_loop_typed::<u32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::F32 => {
+            input_loop_typed::<f32, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::I64 => {
+            input_loop_typed::<i64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::U64 => {
+            input_loop_typed::<u64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
+        SampleFormat::F64 => {
+            input_loop_typed::<f64, _, _>(inner, &mut data_callback, &mut error_callback)
+        }
         _ => {
             error_callback(ErrorKind::StreamInvalidated.into());
         }
     }
 }
 
-fn input_loop_typed<T, D, E>(
-    inner: Arc<StreamInner>,
-    data_callback: &mut D,
-    error_callback: &mut E,
-) where
+fn input_loop_typed<T, D, E>(inner: Arc<StreamInner>, data_callback: &mut D, error_callback: &mut E)
+where
     T: Copy + Default + FromSample<i32> + Sample,
     D: FnMut(&Data, &CallbackInfo),
     E: FnMut(Error),
@@ -608,9 +534,8 @@ fn input_loop_typed<T, D, E>(
         }
 
         let callback = inner.now();
-        let buffer_duration = Duration::from_secs_f64(
-            inner.buffer_frames as f64 / inner.sample_rate as f64,
-        );
+        let buffer_duration =
+            Duration::from_secs_f64(inner.buffer_frames as f64 / inner.sample_rate as f64);
         let capture = callback.checked_sub(buffer_duration).unwrap_or(callback);
         let timestamp = StreamTimestamp {
             callback,
@@ -701,11 +626,9 @@ fn output_loop_typed<T, D, E>(
         }
 
         let callback = inner.now();
-        let buffer_duration = Duration::from_secs_f64(
-            inner.buffer_frames as f64 / inner.sample_rate as f64,
-        );
-        let playback =
-            callback.checked_add(buffer_duration).unwrap_or(callback);
+        let buffer_duration =
+            Duration::from_secs_f64(inner.buffer_frames as f64 / inner.sample_rate as f64);
+        let playback = callback.checked_add(buffer_duration).unwrap_or(callback);
         let timestamp = StreamTimestamp {
             callback,
             device: playback,
@@ -891,9 +814,7 @@ struct SampleFormatInfo {
     sig: u32,
 }
 
-fn sample_format_to_sndio(
-    sample_format: SampleFormat,
-) -> Option<SampleFormatInfo> {
+fn sample_format_to_sndio(sample_format: SampleFormat) -> Option<SampleFormatInfo> {
     match sample_format {
         SampleFormat::I8 => Some(SampleFormatInfo {
             bits: 8,

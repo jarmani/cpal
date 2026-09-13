@@ -38,8 +38,6 @@ pub(crate) mod audioworklet;
 #[cfg(target_vendor = "apple")]
 pub(crate) mod coreaudio;
 
-#[cfg(target_os = "openbsd")]
-pub(crate) mod sndio;
 #[cfg(all(
     feature = "jack",
     any(
@@ -52,6 +50,8 @@ pub(crate) mod sndio;
     )
 ))]
 pub(crate) mod jack;
+#[cfg(target_os = "openbsd")]
+pub(crate) mod sndio;
 
 #[cfg(all(
     any(
