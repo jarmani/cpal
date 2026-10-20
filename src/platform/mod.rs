@@ -123,6 +123,7 @@ macro_rules! impl_platform_host {
         /// - `"custom"` - Custom host (requires `custom` feature)
         /// - `"jack"` - JACK Audio Connection Kit
         /// - `"null"` - Null host
+        /// - `"sndio"` - Sndio
         /// - `"wasapi"` - Windows Audio Session API
         /// - `"webaudio"` - Web Audio API
         ///
@@ -902,6 +903,24 @@ mod platform_impl {
     }
 }
 
+#[cfg(target_os = "openbsd")]
+mod platform_impl {
+    #[cfg_attr(docsrs, doc(cfg(target_os = "openbsd")))]
+    pub use crate::host::sndio::Host as SndioHost;
+
+    impl_platform_host!(
+        Sndio => SndioHost,
+        #[cfg(feature = "custom")] Custom => super::CustomHost
+    );
+
+    /// The default host for the current compilation target platform.
+    pub fn default_host() -> Host {
+        SndioHost::new()
+            .expect("the default host should always be available")
+            .into()
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 mod platform_impl {
     #[cfg(all(feature = "jack", target_os = "macos"))]
@@ -1000,6 +1019,7 @@ mod platform_impl {
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "netbsd",
+    target_os = "openbsd",
     target_vendor = "apple",
     target_os = "android",
     all(
@@ -1009,7 +1029,23 @@ mod platform_impl {
     ),
 )))]
 mod platform_impl {
-    use crate::host::null::Host as NullHost;
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(not(any(
+            windows,
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "emscripten",
+            target_os = "android",
+            all(target_arch = "wasm32", feature = "wasm-bindgen")
+        ))))
+    )]
+    pub use crate::host::null::Host as NullHost;
 
     impl_platform_host!(
         Null => NullHost,

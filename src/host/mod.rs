@@ -50,6 +50,8 @@ pub(crate) mod coreaudio;
     )
 ))]
 pub(crate) mod jack;
+#[cfg(target_os = "openbsd")]
+pub(crate) mod sndio;
 
 #[cfg(all(
     any(
@@ -92,6 +94,7 @@ pub(crate) mod custom;
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "netbsd",
+    target_os = "openbsd",
     target_vendor = "apple",
     target_os = "android",
     all(

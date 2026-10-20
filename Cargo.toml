@@ -230,6 +230,9 @@ libc = "0.2"
 num-derive = "0.4"
 num-traits = "0.2"
 
+[target.'cfg(target_os = "openbsd")'.dependencies]
+sndio = "0.1.0"
+
 [[example]]
 name = "beep"
 
@@ -276,4 +279,5 @@ targets = [
   "x86_64-unknown-freebsd",
   "x86_64-unknown-netbsd",
   "x86_64-unknown-dragonfly",
+  "x86_64-unknown-openbsd",
 ]
